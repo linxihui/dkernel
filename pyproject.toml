@@ -3,11 +3,11 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "s2attn"
+name = "dkernel"
 version = "0.0.1"
 authors = [
     {name = "Xihui Lin", email = "ericxihuilin@outlook.com"},
-    {name = "Yunan Zhang", email = "USER.NAME@EMAIL.com"}
+    {name = "Yunan Zhang", email = "eric.zhang.uiuc@gmail.com"}
 ]
 readme = "README.md"
 dependencies = [
@@ -16,4 +16,4 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["s2attn*"]
+include = ["dkernel*"]

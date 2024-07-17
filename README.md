@@ -1,18 +1,22 @@
-# s2attn
+# Introduction
+
+This repo contains customized CUDA kernel written in OpenAI Triton.
+As of now, it contains the sparse attention kernel used in [phi-3-small models](https://huggingface.co/microsoft/Phi-3-small-8k-instruct).
+This sparse attention is also supported in vLLM for fast inference.
 
 Refernece:
 
 # Install
 
 ```sh
-pip install git+https://github.com/linxihui/s2attn
+pip install git+https://github.com/linxihui/dkernel
 ```
 
 # Quick start
 
 ```python
 import torch
-from s2attn import SparseAttention, LocalStrideSparseAttention
+from dkernel import SparseAttention, LocalStrideSparseAttention
 
 
 # 1.) Using local-stride pattern
@@ -60,7 +64,7 @@ output = attn(q, k, v, sm_scale=0.008)
 ```
 
 
-# TODO
+# Todo
 
 - [x] *1*. allow change seqlen in backward: using start/end instead culen,
     culen vector can be modifed to 2 column start-end using as_strided.
