@@ -1,7 +1,7 @@
 import torch
 import pytest
 import math
-from s2attn import get_sparse_attn_mask, LocalStrideSparseAttention
+from dkernel import get_sparse_attn_mask, LocalStrideSparseAttention
 
 
 def torch_attention(q, k, v,

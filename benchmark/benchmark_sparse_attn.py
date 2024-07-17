@@ -2,7 +2,7 @@
 import torch
 import triton
 import os
-from s2attn import LocalStrideSparseAttention
+from dkernel import LocalStrideSparseAttention
 
 try:
     import flash_attn

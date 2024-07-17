@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 from typing import Tuple, Optional
-from s2attn.utils import multiple_of, is_hip
+from dkernel.utils import multiple_of, is_hip
 
 import ipdb
 _b = ipdb.set_trace

@@ -1,5 +1,5 @@
 import torch
-from s2attn import LocalStrideSparseAttention
+from dkernel import LocalStrideSparseAttention
 
 try:
     import flash_attn
@@ -16,7 +16,7 @@ def run_profiling(
         local_tokens=512, vert=16,
         d_splits=None, block_size=64,
         block_m=None, block_n=None,
-        save_path='./profiing_s2attn',
+        save_path='./profiing_dkernel',
         num_dense_heads=0,
         homo_head=False,
         ):

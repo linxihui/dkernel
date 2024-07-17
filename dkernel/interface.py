@@ -4,14 +4,14 @@ import warnings
 from torch import Tensor
 from functools import lru_cache
 from typing import Tuple, Optional
-from s2attn.utils import (get_sparse_attn_mask,
+from dkernel.utils import (get_sparse_attn_mask,
                           dense_to_ccol_row,
                           multiple_of,
                           is_kv_cache_friendly,
                           verify_sparse_pattern,
                           merge_split_fwd_kernel_blocks,
                           zero_stride)
-from s2attn.ops import _sparse_attention
+from dkernel.ops import _sparse_attention
 
 
 class SparseAttention(torch.nn.Module):

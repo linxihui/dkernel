@@ -1,8 +1,8 @@
 import torch
 from torch import Tensor
 from typing import Tuple, Dict, Union
-from s2attn.ops.sparse_attn_fwd import _forward
-from s2attn.ops.sparse_attn_bwd import _backward
+from dkernel.ops.sparse_attn_fwd import _forward
+from dkernel.ops.sparse_attn_bwd import _backward
 
 
 class _sparse_attention(torch.autograd.Function):
