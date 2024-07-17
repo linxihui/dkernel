@@ -1,0 +1,348 @@
+import torch
+import pytest
+import math
+from s2attn import get_sparse_attn_mask, LocalStrideSparseAttention
+
+
+def torch_attention(q, k, v,
+                    attn_mask=None,
+                    sm_scale=None,
+                    block_attn_mask=None,
+                    block_size=128,
+                    do=None,
+                    seq_dim=2):
+    """
+    :param q, k, v: shape=(batch, heads, seq, head_dim) if seq_dim=2 (default)
+            or shape=(batch, seq, heads, head_dim) if seq_dim=1.
+    """
+    # for verification
+    if sm_scale is None:
+        sm_scale = 1 / math.sqrt(float(q.size(-1)))
+
+    assert seq_dim in [1, 2]
+    if seq_dim == 1:
+        q, k, v = [x.transpose(1, 2) for x in [q, k, v]]
+        if do is not None:
+            do = do.transpose(1, 2)
+
+    if block_attn_mask is not None:
+        assert attn_mask is None
+        outs = []
+        for s in range(0, q.size(2), block_size):
+            e = min(s + block_size, q.size(2))
+            q_block = q[:, :, s:e]
+            attn = torch.einsum('bhmd,bhnd->bhmn', q_block, k[:, :, :e]).float() * sm_scale
+            mask = block_attn_mask[..., s // block_size, : (s // block_size + 1)]
+            mask = torch.kron(mask, torch.ones(block_size, block_size, device=mask.device))
+            mask[..., :, s:].masked_fill_(torch.arange(0, block_size)[:, None] <= torch.arange(0, block_size)[None, :], 0)
+            attn = attn.masked_fill((1 - mask).bool(), float('-inf'))
+            attn = attn.softmax(-1)
+            out = torch.einsum('bhmn,bhnd->bhmd', attn.type_as(v), v[:, :, :e])
+            outs.append(out)
+        torch_output = torch.cat(outs, dim=2)
+    else:
+        attn = torch.einsum('bhmd,bhnd->bhmn', q, k).float() * sm_scale
+        if attn_mask is not None:
+            attn = attn.masked_fill((1 - attn_mask).bool(), float('-inf'))
+
+        attn = attn.softmax(-1)
+        if do is not None:
+            dv = torch.einsum('bhqk,bhqd->bhkd', attn.type_as(do), do)
+            print(f'> torch_attn computed dv: {dv=}')
+        torch_output = torch.einsum('bhmn,bhnd->bhmd', attn.type_as(v), v)
+
+    if seq_dim == 1:
+        torch_output = torch_output.transpose(1, 2)
+    return torch_output
+
+
+def print_diff_stats(ref, tri):
+    abs_v, abs_i = (ref - tri).abs().ravel().max(-1)
+    tri2 = tri[ref.abs() > 1e-5]
+    ref2 = ref[ref.abs() > 1e-5]
+
+    sel_mask = torch.rand_like(tri2) > 0.9
+    rel_v, rel_i = (tri2.abs() / ref2.abs() - 1).abs().ravel().max(0)
+    rel_quantile_99 = (tri2.abs() / ref2.abs()).float()[sel_mask].quantile(0.99).item()
+    coord = tuple(x[0].item() if len(x) else -1 for x in torch.where((ref - tri).abs() == abs_v))
+
+
+    diff = (ref - tri).abs().float()
+    sel_mask = torch.rand_like(diff) > 0.9
+    diff = diff[sel_mask]
+
+
+    msg = (f'>> rel_diff={rel_v.item()}, ref={ref2[rel_i]}, tri={tri2[rel_i]}, {rel_quantile_99=}\n'
+          f'.. max_abs_diff={abs_v.item()}, {ref.ravel()[abs_i].item()=}, {tri.ravel()[abs_i].item()=}, {coord=}\n'
+          f'.. {(ref - tri).abs().mean().item()=},\n'
+          f'.. {diff.quantile(0.9).item()=},\n'
+          f'.. {diff.quantile(0.99).item()=},\n'
+          f'.. {diff.quantile(0.999).item()=},\n'
+          f'.. {ref[sel_mask].abs().float().quantile(0.99).item()=},\n'
+          f'.. {ref[sel_mask].abs().float().quantile(0.999).item()=},\n'
+          f'.. {ref.abs().mean().item()=},\n'
+          f'.. {(ref - tri).abs().ravel().topk(10).values=}')
+    return (msg)
+
+
+# @pytest.mark.parametrize('b, h, seqlen, d', [(2, 8, 2048, 128), (1, 4, 4096, 64)])
+def general_test_fn(b, h, seqlen, d,
+            past_len=None,
+            dtype=torch.bfloat16,
+            homo_head=False,
+            block_size=64,
+            backward=True,
+            sparse_attention_fn=None,
+            local_blocks=4,
+            vert_stride=4,
+            sm_scale=None,
+            num_dense_heads=0,
+            max_seqlen=None,
+            block_m=None,
+            block_n=None,
+            non_contiguous=False,
+            d_splits=None,
+            seq_dim=2,
+            head_sliding_offset=0,
+            num_kv_heads=None):
+
+    qlen = seqlen
+    past_len = past_len or 0
+    seqlen = qlen + past_len
+
+    max_seqlen = max_seqlen or seqlen
+    torch.manual_seed(20)
+
+    assert seq_dim in [1, 2]
+
+    if non_contiguous:
+        h2 = h + 17
+        seqlen2 = seqlen + 101
+        qlen2 = qlen + 19
+    else:
+        h2, seqlen2, qlen2 = h, seqlen, qlen
+    if seq_dim == 2:
+        q = torch.empty((b, h2, qlen2  , d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
+        k = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
+        v = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
+        q = q[:, :h, :qlen]
+        k = k[:, :h, :seqlen]
+        v = v[:, :h, :seqlen]
+        h_dim = 1
+    else:
+        q = torch.empty((b, qlen2  , h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
+        k = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
+        v = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
+        q = q[:, :qlen, :h]
+        k = k[:, :seqlen,   :h]
+        v = v[:, :seqlen,   :h]
+        h_dim = 2
+
+    if sm_scale is None:
+        sm_scale = 1. / math.sqrt(d)
+
+    sm_scale = 0.0078125
+    if backward:
+        q.requires_grad_(), k.requires_grad_(), v.requires_grad_()
+
+    dout = torch.randn_like(q).contiguous()
+
+
+    mask_csr, block_mask, mask_dense = get_sparse_attn_mask(k.size(h_dim), k.size(seq_dim),
+                                                            block_size=block_size,
+                                                            local_blocks=local_blocks,
+                                                            vert_stride=vert_stride,
+                                                            homo_head=homo_head,
+                                                            num_kv_heads=num_kv_heads,
+                                                            past_len=past_len,
+                                                            num_dense_heads=num_dense_heads,
+                                                            head_sliding_offset=head_sliding_offset,
+                                                            return_dense=True)
+
+    # reference implementation
+    ref_out = torch_attention(q, k, v, mask_dense, sm_scale, seq_dim=seq_dim)
+
+    if backward:
+        ref_out.backward(dout)
+        ref_dv, v.grad = v.grad.clone(), None
+        ref_dk, k.grad = k.grad.clone(), None
+        ref_dq, q.grad = q.grad.clone(), None
+
+    if sparse_attention_fn is None:
+        sparse_attention_fn = LocalStrideSparseAttention(h, max_seqlen,
+                                                     block_size,
+                                                     local_blocks,
+                                                     vert_stride,
+                                                     homo_head=homo_head,
+                                                     num_kv_heads=num_kv_heads,
+                                                     num_dense_heads=num_dense_heads,
+                                                     block_m=block_m,
+                                                     block_n=block_n,
+                                                     d_splits=d_splits,
+                                                     seq_dim=seq_dim,
+                                                     head_sliding_offset=0)
+        sparse_attention_fn.to(q.device).to(q.dtype)
+    tri_out = sparse_attention_fn(q, k, v, sm_scale)
+
+    # # import ipdb; ipdb.set_trace()
+    # decimal = 1 if dtype == torch.bfloat16 else 2
+    assert torch.allclose(ref_out.cpu(), tri_out.cpu(), atol=1e-2, rtol=1e-2), \
+        "---- out ---\n" + print_diff_stats(ref_out, tri_out)
+
+    if backward:
+        tri_out.backward(dout)
+        tri_dv, v.grad = v.grad.clone(), None
+        tri_dk, k.grad = k.grad.clone(), None
+        tri_dq, q.grad = q.grad.clone(), None
+
+    if backward:
+        assert torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=1e-2), \
+            "---- dv ---\n" + print_diff_stats(ref_dv, tri_dv)
+        assert torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=0), \
+            "---- dk ---\n" + print_diff_stats(ref_dk, tri_dk)
+        assert torch.allclose(ref_dq, tri_dq, atol=2e-2, rtol=0), \
+            "---- dq ---\n" + print_diff_stats(ref_dq, tri_dq)
+
+    print('-'*80,
+          f'\nTest passed:'
+          f'\n  {b=}, {h=}, {seqlen=}, {d=}, {past_len=}, {dtype=}',
+          f'\n  {homo_head=}, {block_size=}, {local_blocks=}, {vert_stride=}'
+          f'\n  {block_m=}, {block_n=}, {num_dense_heads=}, {d_splits=}',
+          f'\n  {seq_dim=}, {non_contiguous=}'
+          '\n' + f'-'*80)
+
+
+### all tests ###
+
+def test_dims_and_dtype():
+    # diff dim, float types (float16, bfloat16, float32)
+    print("### Test different head dims(64, 128, 256)" + \
+            ", float types (float16, bfloat16, float32) ###")
+    general_test_fn(1, 1, 1024, 64, block_size=64,
+            dtype=torch.float16, homo_head=False)
+    general_test_fn(2, 8, 1024, 64, block_size=64,
+            dtype=torch.float32, homo_head=False)
+    general_test_fn(2, 8, 1024, 128, block_size=64,
+        dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 1024, 256, block_size=64,
+        dtype=torch.bfloat16, homo_head=False)
+
+
+def test_seqlen():
+    # diff seqlen
+    print("### Test different sequence lengths ###")
+    general_test_fn(2, 8, 15, 128,  block_size=64,
+        dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 1028, 128,  block_size=32,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 5175, 128,  block_size=64,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 128,  block_size=64,
+            dtype=torch.bfloat16, homo_head=False)
+
+
+def test_inference():
+    print('### Test inference prompting and decoding ###')
+    # short prompt
+    general_test_fn(2, 8, 15, 128,  past_len=0, max_seqlen=8192,
+            block_size=64, backward=False,
+            dtype=torch.bfloat16, homo_head=False)
+    # decoding
+    general_test_fn(2, 8, 1, 128,  past_len=64*5 + 12, max_seqlen=8192,
+            block_size=64, backward=False,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 1, 128,  past_len=64*50 + 12, max_seqlen=8192,
+            block_size=16, backward=False,
+            dtype=torch.bfloat16, homo_head=False)
+    # # chunked prefilling, not supported yet
+    # general_test_fn(2, 8, 12, 128,  past_len=2273, max_seqlen=8192,
+    #         block_size=64, backward=False,
+    #         dtype=torch.bfloat16, homo_head=False)
+    # general_test_fn(1, 1, 65, 128,  past_len=120, max_seqlen=8192,
+    #     block_size=64, backward=False,
+    #     dtype=torch.bfloat16, homo_head=False)
+
+
+def test_patterns():
+    print("### Test difference sparsity, including dense heads, homo pattern ###")
+    # diff local, vertical stride
+    general_test_fn(2, 8, 8192, 128,  block_size=64,
+            local_blocks=10, vert_stride=3,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 128,  block_size=64,
+            local_blocks=1, vert_stride=8,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 128,  block_size=64,
+            local_blocks=8, vert_stride=1,
+            dtype=torch.bfloat16, homo_head=False)
+    # with dense heads
+    general_test_fn(2, 8, 8192, 128,  block_size=64,
+            num_dense_heads=2,
+            dtype=torch.bfloat16, homo_head=False)
+    # homo head
+    general_test_fn(2, 8, 8192, 128,  block_size=64,
+            dtype=torch.bfloat16, homo_head=True)
+
+
+def test_sparse_block_sizes():
+    # diff block size, with default block_m, block_n
+    print("### Test different sparse block_size ###")
+    general_test_fn(2, 8, 8192, 128,  block_size=16,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 128,  block_size=32,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 128,  block_size=64,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 128,  block_size=128,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 64,  block_size=128,
+        dtype=torch.bfloat16, homo_head=False)
+
+
+def test_kernel_block_sizes():
+    # diff block_m, block_n
+    print("### Test different kernel block size ###")
+    general_test_fn(2, 8, 8192, 128,  block_size=16,
+            block_m=16, block_n=16,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 128,  block_size=16,
+            block_m=128, block_n=16,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 128,  block_size=64,
+            block_m=128, block_n=32,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 128,  block_size=128,
+            block_m=64, block_n=64,
+            dtype=torch.bfloat16, homo_head=False)
+    # potential interact on diag blocks
+    general_test_fn(2, 8, 8192, 128,  block_size=16,
+            block_m=128, block_n=16, local_blocks=1,
+            dtype=torch.bfloat16, homo_head=False)
+
+
+def test_seq_dim_non_contiguous_qkv():
+    # seq_dim=1
+    print("### Test seq_dim=1 and non-contiguous qkv layout ###")
+    general_test_fn(2, 8, 8192, 128,  block_size=64, seq_dim=1,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 128,  block_size=64, seq_dim=1,
+            non_contiguous=True,
+            dtype=torch.bfloat16, homo_head=False)
+    # non-contiguous q/k/v
+    general_test_fn(2, 8, 8192, 128,  block_size=64, non_contiguous=True,
+            dtype=torch.bfloat16, homo_head=False)
+
+
+def test_d_splits():
+    """
+    By Default, d_splits=1 if head_dim <= 64 else 2.
+    """
+    # d_plits=1 for 128, 256. Default is 2
+    print("Teset non default d_splits for different head size.")
+    general_test_fn(2, 8, 8192, 128,  block_size=64, d_splits=1,
+            dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 8192, 256,  block_size=64, d_splits=1,
+            dtype=torch.bfloat16, homo_head=False)
+    # d_splits=2 for 64
+    general_test_fn(2, 8, 8192, 64,  block_size=64, d_splits=2,
+            dtype=torch.bfloat16, homo_head=False)

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "s2attn"
+version = "0.0.1"
+authors = [
+    {name = "Xihui Lin", email = "ericxihuilin@outlook.com"},
+    {name = "Yunan Zhang", email = "USER.NAME@EMAIL.com"}
+]
+readme = "README.md"
+dependencies = [
+  "fire",
+  "triton @ git+https://github.com/openai/triton@fa2271e37f4e0ccfa8829501e40533060937cfe5#subdirectory=python",
+]
+
+[tool.setuptools.packages.find]
+include = ["s2attn*"]
