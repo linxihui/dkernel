@@ -9,7 +9,6 @@ import ipdb
 _b = ipdb.set_trace
 
 
-
 @triton.jit
 def _fwd_one_kv_block(
     bid_n, micro_M,
@@ -376,3 +375,6 @@ def _forward(ctx,
     ctx.kwargs = kwargs
 
     return o
+
+
+__all__ = ["_forward"]

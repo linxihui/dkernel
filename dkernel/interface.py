@@ -18,7 +18,7 @@ class SparseAttention(torch.nn.Module):
     """
     Arguments
     =========
-    block_size: sparse_block_size
+    block_size: sparse_block_size. It has to be power of 2 and minimum of 16.
     sparse_pattern: 2D or 3D (per head) boolean/uint8 Tensor(squared). 1=used, 0=skipped
     kwargs: kernel args, do not use unless you know what you're doing.
             "out": to specify an output tensor,
@@ -201,3 +201,9 @@ class LocalStrideSparseAttention(SparseAttention):
             sparse_pattern = sparse_pattern[h_start:h_end]
 
         super().__init__(block_size, sparse_pattern, block_m=block_m, block_n=block_n, **kwargs)
+
+
+__all__ = [
+    "SparseAttention",
+    "LocalStrideSparseAttention",
+    ]

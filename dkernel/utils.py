@@ -28,7 +28,7 @@ def dense_to_crow_col(x: Tensor,
                       include_values: bool=False
                       ) -> Tuple[Tensor, Tensor]:
     ''' Turning a 2D/3D torch tensor (x) to CSR rows/cols indexing.
-    param:
+
     TODO:
         1. improve efficiency, is it faster if done in CPU, or customize a cuda kernel for it?
     NOTE: col_indices padded -1
@@ -115,13 +115,13 @@ def get_sparse_attn_mask(num_heads: int,
                          return_dense=False,
                          head_sliding_offset=0,
                          num_dense_heads=0):
-    '''
+    """
     # TODO: with num_kv_heads, make the pattern size (num_kv_heads, m_blocks, n_blocks), instead of (num_heads, ..., )
     :return: a tuple of 3:
         - tuple of crow_indices, col_indices representation of CSR format.
         - block dense mask
         - all token dense mask (be aware that it can be OOM if it is too big) if `return_dense==True`, otherwise, None
-    '''
+    """
     device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
     past_len = past_len or 0
 
@@ -248,3 +248,9 @@ def is_hip() -> None:
         return triton.runtime.driver.active.get_current_target().backend == "hip"
     except:
         return False
+
+
+def get_q_block_ids(past_len, q_len, block_size):
+    start = past_len // block_size
+    end = triton.cdiv(past_len + q_len, block_size)
+    return range(start, end)

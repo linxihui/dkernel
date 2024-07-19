@@ -21,7 +21,7 @@ from dkernel import SparseAttention, LocalStrideSparseAttention
 
 # 1.) Using local-stride pattern
 
-block_size = 64 # sparse block size
+block_size = 64 # sparse block size, minimum 16
 local_blocks = 32 # num local blocks, always attend to up to 64 * 16=1024 token
 vert_stride = 8 # attend to 1 block per every 8 blocks after the local window above
 max_seq_len = 8192 # model supports up to 8192 seqlen
@@ -34,7 +34,7 @@ attn = LocalStrideSparseAttention(
                  local_blocks, 
                  vert_stride,
                  seq_dim=1, # q/k/v layout: (batch, seqlen, num_heads, head_dim)
-        )
+                )
 
 q, k, v = [torch.rand(2, 8192, 32, 128, device="cuda") for _ in range(3)]
 

@@ -629,7 +629,7 @@ def _backward(ctx,
               dv: Optional[Tensor]=None
               ) -> Tuple[Tensor, Tensor, Tensor]:
     """
-    
+
     """
     q, k, v, o, l, m = ctx.saved_tensors
 
@@ -660,7 +660,7 @@ def _backward(ctx,
     dq = _check_or_new_tensor(dq)
     dk = _check_or_new_tensor(dk)
     dv = _check_or_new_tensor(dv)
-    
+
     # dq = dq if dq is not None else q.new_empty(q.shape).contiguous()
     # dk = dk if dk is not None else k.new_empty(k.shape).contiguous()
     # dv = dv if dv is not None else v.new_empty(v.shape).contiguous()
@@ -798,4 +798,8 @@ def _backward(ctx,
             NUM_DBLOCKS=q.shape[-1] // ctx.BLOCK_DMODEL,
             **ctx.kwargs
         )
+
     return dq, dk, dv
+
+
+__all__ = ["_backward"]
