@@ -104,7 +104,10 @@ def general_test_fn(b, h, seqlen, d,
             d_splits=None,
             seq_dim=2,
             head_sliding_offset=0,
-            num_kv_heads=None):
+            num_kv_heads=None,
+            varlen=False,
+            has_left_paddings=False,
+            has_right_paddings=False):
 
     qlen = seqlen
     past_len = past_len or 0
@@ -182,7 +185,61 @@ def general_test_fn(b, h, seqlen, d,
                                                      seq_dim=seq_dim,
                                                      head_sliding_offset=0)
         sparse_attention_fn.to(q.device).to(q.dtype)
-    tri_out = sparse_attention_fn(q, k, v, sm_scale)
+
+    if varlen:
+        backward = False
+        lens = torch.randint(0, k.size(seq_dim), size=(k.size(0)))
+        cu_seqlen_k = torch.cat([lens.new_zeros(1), lens.cumsum(0)]).to(torch.int32).to(q.device)
+        assert seq_dim == 1
+        k = torch.cat([x.narrow(0, 0, l) for l, x in zip(lens, k)], dim=0)
+        v = torch.cat([x.narrow(0, 0, l) for l, x in zip(lens, v)], dim=0)
+        if past_len == 0:
+            q = torch.cat([x.narrow(0, 0, l) for l, x in zip(lens, q)], dim=0)
+        else:
+            assert q.size(1) == 1
+            q = q.view(-1, q.size(2), q.size(3))
+
+        tri_out = sparse_attention_fn(q, k, v, sm_scale, cu_seqlen_k=cu_seqlen_k)
+        ref_out = torch.cat([x.narrow(0, 0, l) for l, x in zip(lens, ref_out)], dim=0)
+
+    elif has_left_paddings or has_right_paddings:
+        backward = False
+        lens = torch.randint(0, k.size(seq_dim), size=(k.size(0)))
+        if has_right_paddings:
+            tri_out = sparse_attention_fn(q, k, v, sm_scale, seqlens=lens)
+            for i, l in enumerate(lens):
+                padding = k.size(seq_dim) - l
+                ref_out[i].narrow(seq_dim - 1, l, padding)[:] = 0
+                tri_out[i].narrow(seq_dim - 1, l, padding)[:] = 0
+                # if seq_dim == 1:
+                #     ref_out[i, l:] = 0
+                #     tri_out[i, l:] = 0
+                # else:
+                #     ref_out[i, :, l:] = 0
+                #     tri_out[i, :, l:] = 0
+        elif has_left_paddings:
+            left_paddings = k.size(seq_dim) - lens
+            for i, len in enumerate(lens):
+                left = k.size(seq_dim) - len
+                k[i].narrow(seq_dim - 1, left, len)[:] = k[i].narrow(seq_dim-1, 0, len)
+                v[i].narrow(seq_dim - 1, left, len)[:] = v[i].narrow(seq_dim-1, 0, len)
+                # k[i, left:] = k[i, :len]
+                # v[i, left:] = v[i, :len]
+                if past_len == 0:
+                    q[i].narrow(seq_dim - 1, left, len)[:] = q[i].narrow(seq_dim-1, 0, len)
+                    # q[i, left:] = q[i, :len]
+            tri_out = sparse_attention_fn(q, k, v, sm_scale, left_paddings=left_paddings)
+            if past_len == 0:
+                for i, len in enumerate(lens):
+                    left = k.size(seq_dim) - len
+                    tri_out[i].narrow(seq_dim - 1, 0, left)[:] = 0
+                    ref_out[i].narrow(seq_dim - 1, left, len)[:] = ref_out[i].narrow(seq_dim - 1, 0, len)
+                    ref_out[i].narrow(seq_dim - 1, 0, left)[:] = 0
+                    # tri_out[i, :left] = 0
+                    # ref_out[i, left:] = ref_out[i, :len]
+                    # ref_out[i, :left] = 0
+    else:
+        tri_out = sparse_attention_fn(q, k, v, sm_scale)
 
     # # import ipdb; ipdb.set_trace()
     # decimal = 1 if dtype == torch.bfloat16 else 2
@@ -241,7 +298,7 @@ def test_seqlen():
             dtype=torch.bfloat16, homo_head=False)
 
 
-def test_inference():
+def test_inference_no_padding():
     print('### Test inference prompting and decoding ###')
     # short prompt
     general_test_fn(2, 8, 15, 128,  past_len=0, max_seqlen=8192,
@@ -262,6 +319,38 @@ def test_inference():
     #     block_size=64, backward=False,
     #     dtype=torch.bfloat16, homo_head=False)
 
+def test_inference_padding_varlen():
+    print('### Test inference prompting and decoding ###')
+    # 1.0, left padding: prompt
+    general_test_fn(2, 8, 4512, 128,  past_len=0, max_seqlen=8192,
+            block_size=64, backward=False,
+            dtype=torch.bfloat16, homo_head=False,
+            has_left_paddings=True)
+    # 1.1, left padding: decoding
+    general_test_fn(2, 8, 1, 128,  past_len=64*15 + 12, max_seqlen=8192,
+            block_size=64, backward=False,
+            dtype=torch.bfloat16, homo_head=False,
+            has_left_paddings=True)
+
+    # 2.0, right padding: prompt
+    general_test_fn(2, 8, 1421, 128,  past_len=0, max_seqlen=8192,
+            block_size=32, backward=False,
+            dtype=torch.bfloat16, homo_head=False,
+            has_right_paddings=True)
+
+    # 2.1, right padding: decoding
+    general_test_fn(2, 8, 1, 128,  past_len=64*18 + 1, max_seqlen=8192,
+            block_size=32, backward=False,
+            dtype=torch.bfloat16, homo_head=False,
+            has_left_paddings=True)
+
+    # 3.0, varlen, prompt
+    general_test_fn(2, 8, 2048, 128,  past_len=0, max_seqlen=8192,
+            block_size=32, backward=False,
+            dtype=torch.bfloat16, homo_head=False,
+            varlen=True)
+    # 3.1, varlen, decoding: not needed, bad KV cache design
+    # 3.2, vllm blocktable
 
 def test_patterns():
     print("### Test difference sparsity, including dense heads, homo pattern ###")

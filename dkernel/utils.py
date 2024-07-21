@@ -165,9 +165,10 @@ def is_kv_cache_friendly(sparse_pattern: Tensor, block_m: int, block_n: int) -> 
     :param block_n: kernel block_size on k tokens
     """
     # start pos of block > end pos of block, then it is under the
+    sparse_pattern = sparse_pattern.to(torch.int8) # signed
     non_diag = torch.arange(0, sparse_pattern.size(1))[:, None] * block_m >= \
                 torch.arange(1, sparse_pattern.size(2) + 1) * block_n
-    non_diag = non_diag.type_as(sparse_pattern)
+    non_diag = non_diag.to(sparse_pattern.device)
     return (((sparse_pattern[:, 1:] - sparse_pattern[:, :-1]) <= 0) | (~non_diag[1:])).all()
 
 
@@ -176,6 +177,14 @@ def verify_sparse_pattern(sparse_pattern: Tensor) -> None:
     """
     assert sparse_pattern.dim() in (2, 3)
     assert sparse_pattern.size(-2) == sparse_pattern.size(-1)
+    assert is_causal(sparse_pattern)
+
+
+def is_causal(sparse_pattern: Tensor) -> bool:
+    sparse_pattern = sparse_pattern.to(torch.int8)
+    assert sparse_pattern.size(-2) == sparse_pattern.size(-1)
+    sparse_pattern = sparse_pattern * (1 - torch.tril(torch.ones_like(sparse_pattern[0])))
+    return not sparse_pattern.any()
 
 
 def merge_split_fwd_kernel_blocks(block_size: int,

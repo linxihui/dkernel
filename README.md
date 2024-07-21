@@ -36,10 +36,14 @@ attn = LocalStrideSparseAttention(
                  seq_dim=1, # q/k/v layout: (batch, seqlen, num_heads, head_dim)
                 )
 
+# attn.to("cuda") # optional, attn default to current_device
 q, k, v = [torch.rand(2, 8192, 32, 128, device="cuda") for _ in range(3)]
 
-output = attn(q, k, v)
+# This first time, it needs to warmup, so could be slow.
+attn(q, k, v)
 
+# Now should be fast
+ouput = attn(q, k, v)
 
 # 2.) Using user defined arbitrary pattern
 
@@ -59,8 +63,11 @@ for head_sparse_pattern in block_sparse_pattern:
 # So you may need to consider properly design the sparse pattern carefully.
 
 attn = SparseAttention(block_size, block_sparse_pattern)
+attn.cuda()
 
+# similar, it needs to warmup the first time it runs
 output = attn(q, k, v, sm_scale=0.008)
+
 ```
 
 

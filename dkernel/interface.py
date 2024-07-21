@@ -105,20 +105,37 @@ class SparseAttention(torch.nn.Module):
                 q: Tensor,
                 k: Tensor,
                 v: Tensor,
-                sm_scale: Optional[int]=None
+                sm_scale: Optional[int]=None,
+                *,
+                cu_seqlen_k: Optional[Tensor]=None,
+                cu_seqlen_q: Optional[Tensor]=None,
+                left_paddings: Optional[Tensor]=None,
+                seqlens: Optional[Tensor]=None,
                 ) -> Tensor:
         """
         :param q, k, v: shape=(batch, heads, seq, head_dim) if self.seq_dim=2 (default)
-              or shape=(batch, seq, heads, head_dim) if self.seq_dim=1.
+                or shape=(batch, seq, heads, head_dim) if self.seq_dim=1.
         :param sm_scale: softmax scale, default to `1/sqrt(q.size(-1))`.
+        :param cu_seqlen_k: shape=(batch+1, ) (0, seqlen1, seqlen1 + seqlen2, ...., sum(seqlens))
+        :param cu_seqlen_q: shape=(batch+1, ), similar to above, but for q.
+        :param left_paddings: (batch, ), number of left paddings for each sample.
+        :param seqlens: real seqlen, can be optionally used when has right padding.
+                No need to specify if left_paddings is used.
         """
         sm_scale = sm_scale or 1. / math.sqrt(float(q.size(-1)))
+
+        inf_kwargs = {"cu_seqlen_k": cu_seqlen_k,
+                      "cu_seqlen_q": cu_seqlen_q,
+                      "left_paddings": left_paddings,
+                      "seqlens": seqlens
+                      }
 
         return _sparse_attention.apply(q, k, v,
                     sm_scale,
                     (self.layout_csr_crow, self.layout_csr_col, self.block_m, self.block_n),
                     (self.layout_csc_ccol, self.layout_csc_row, self.block_size, self.block_size),
                     self.seq_dim,
+                    inf_kwargs,
                     self.kwargs
                     )
 
