@@ -26,6 +26,9 @@ local_blocks = 32 # num local blocks, always attend to up to 64 * 16=1024 token
 vert_stride = 8 # attend to 1 block per every 8 blocks after the local window above
 max_seq_len = 8192 # model supports up to 8192 seqlen
 num_heads = 32
+device = "cuda"
+
+q, k, v = [torch.rand(2, 8192, 32, 128, device=device).requires_grad_() for _ in range(3)]
 
 attn = LocalStrideSparseAttention(
                  num_heads,
@@ -35,9 +38,7 @@ attn = LocalStrideSparseAttention(
                  vert_stride,
                  seq_dim=1, # q/k/v layout: (batch, seqlen, num_heads, head_dim)
                 )
-
-# attn.to("cuda") # optional, attn default to current_device
-q, k, v = [torch.rand(2, 8192, 32, 128, device="cuda") for _ in range(3)]
+attn.to(device) # optional, attn default to current_device
 
 # This first time, it needs to warmup, so could be slow.
 attn(q, k, v)
@@ -52,18 +53,21 @@ num_blocks = max_seq_len // block_size
 # True/1 means attn to the blocks, 0 means not attend to.
 block_sparse_pattern = torch.rand((num_heads, num_blocks, num_blocks)) > 0.8
 
-# make sure the diag block is always 1, i.e. the current block should always be attended to
-# otherwise, for token at block_0 will resulst in nothing to attend to
+# Ensure the diag blocks are always attended.
+# Otherwise, tokens at block_0 have nothing to attend to
 for head_sparse_pattern in block_sparse_pattern:
     head_sparse_pattern.diagonal()[:] = True
+
+# Ensure it is causal
+block_sparse_pattern *= torch.tril(torch.ones_like(block_sparse_pattern[0]))
 
 # NOTE: You may get warning saying that pattern is not KV cache friendly, due to
 # KV cache needed for later tokens are not used in earlier tokens.
 # This may result in unexpected larger KV cache.
 # So you may need to consider properly design the sparse pattern carefully.
 
-attn = SparseAttention(block_size, block_sparse_pattern)
-attn.cuda()
+attn = SparseAttention(block_size, block_sparse_pattern, seq_dim=1)
+attn.to(device)
 
 # similar, it needs to warmup the first time it runs
 output = attn(q, k, v, sm_scale=0.008)

@@ -260,8 +260,8 @@ def _forward(ctx,
             v: Tensor,
             sm_scale: int,
             layout_csr: Tuple[Tensor, Tensor, int, int],
-            seq_dim: int=2,
-            inference: int=None,
+            seq_dim: int=1,
+            inference: Optional[bool]=None,
             out:Optional[Tensor]=None,
             d_splits: Optional[int]=None
             ) -> Tensor:
@@ -286,6 +286,15 @@ def _forward(ctx,
 
     layout_crow_indices, layout_col_indices, block_m, block_n = layout_csr
     qlen, klen = q.size(seq_dim), k.size(seq_dim)
+    num_heads, num_kv_heads = q.size(hdim), k.size(hdim)
+
+
+    num_head_patterns = layout_crow_indices.size(0)
+    if num_head_patterns > 1:
+        assert num_head_patterns in [num_heads, num_kv_heads]
+
+    # TODO: Remove the need to slicing layout_crow_indices.
+    #       Compute the offset inside the kernel
     if qlen != klen:
         # assert klen > qlen
         assert qlen == 1, \

@@ -16,7 +16,7 @@ class _sparse_attention(torch.autograd.Function):
                 sm_scale: int,
                 layout_csr: Tuple[Tensor, Tensor, int, int],
                 layout_csc: Tuple[Tensor, Tensor, int, int],
-                seq_dim: int,
+                seq_dim: Optional[int],
                 inf_kwargs: Dict,
                 kwargs: Dict) -> Tensor:
         '''
@@ -27,10 +27,12 @@ class _sparse_attention(torch.autograd.Function):
         # shape constraints
         ctx.layout_csr = layout_csr
         ctx.layout_csc = layout_csc
+        seq_dim = 1 if seq_dim is None else seq_dim
 
         assert q.dim() in (3, 4)
         # need_backwards = q.requires_grad() or k.requires_grad() or v.requires_grad()
         if q.dim() == 3:
+            # assert seq_dim is None, f"cannot set seq_dim for variable length inputs"
             assert inf_kwargs.get("cu_seqlen_k", None) is not None
             ctx.support_backward = False
             ctx.message = "Currently does not suppoort variable length inputs. WIP."

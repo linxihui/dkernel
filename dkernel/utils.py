@@ -177,7 +177,7 @@ def verify_sparse_pattern(sparse_pattern: Tensor) -> None:
     """
     assert sparse_pattern.dim() in (2, 3)
     assert sparse_pattern.size(-2) == sparse_pattern.size(-1)
-    assert is_causal(sparse_pattern)
+    assert is_causal(sparse_pattern), "Only causal attention is supported now."
 
 
 def is_causal(sparse_pattern: Tensor) -> bool:

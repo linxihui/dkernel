@@ -20,6 +20,7 @@ class SparseAttention(torch.nn.Module):
     =========
     block_size: sparse_block_size. It has to be power of 2 and minimum of 16.
     sparse_pattern: 2D or 3D (per head) boolean/uint8 Tensor(squared). 1=used, 0=skipped
+    seq_dim: Choices=[None, 1, 2]. Default to 1. Only applied to 4D inputs. Ignore if inputs have packed variable lengths.
     kwargs: kernel args, do not use unless you know what you're doing.
             "out": to specify an output tensor,
             "d_splits": None/1/2. Number of splits on the HEAD_DIM, Default to 2 if head_dim >=128.
@@ -28,8 +29,8 @@ class SparseAttention(torch.nn.Module):
     Methods
     =======
     forward:
-        :param q, k, v: shape=(batch, heads, seq, head_dim) if self.seq_dim=2 (default)
-              or shape=(batch, seq, heads, head_dim) if self.seq_dim=1.
+        :param q, k, v: shape=(batch, seq, heads, head_dim) if self.seq_dim=1 or None (default)
+              or shape=(batch, heads, seq, head_dim) if self.seq_dim=2.
         :param sm_scale: softmax scale, default to `1/sqrt(q.size(-1))`.
 
     """
@@ -39,7 +40,7 @@ class SparseAttention(torch.nn.Module):
                  *,
                  block_m: Optional[int]=None,
                  block_n: Optional[int]=None,
-                 seq_dim: int=2,
+                 seq_dim: Optional[int]=None,
                  **kwargs):
         super().__init__()
 
@@ -113,8 +114,8 @@ class SparseAttention(torch.nn.Module):
                 seqlens: Optional[Tensor]=None,
                 ) -> Tensor:
         """
-        :param q, k, v: shape=(batch, heads, seq, head_dim) if self.seq_dim=2 (default)
-                or shape=(batch, seq, heads, head_dim) if self.seq_dim=1.
+        :param q, k, v: shape=(batch, seq, heads, head_dim) if self.seq_dim=1 or None (default)
+              or shape=(batch, heads, seq, head_dim) if self.seq_dim=2.
         :param sm_scale: softmax scale, default to `1/sqrt(q.size(-1))`.
         :param cu_seqlen_k: shape=(batch+1, ) (0, seqlen1, seqlen1 + seqlen2, ...., sum(seqlens))
         :param cu_seqlen_q: shape=(batch+1, ), similar to above, but for q.
