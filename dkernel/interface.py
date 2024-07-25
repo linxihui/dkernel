@@ -88,7 +88,7 @@ class SparseAttention(torch.nn.Module):
 
         verify_sparse_pattern(sparse_pattern)
         if not is_kv_cache_efficient(sparse_pattern, block_size, block_size):
-            warnings.warn("The provided sparse_pattern is not friendly for KV cache, "
+            warnings.warn("The provided sparse_pattern is not efficient for KV cache, "
                           "i.e., KV cache needed for later tokens are not used in "
                           "earlier tokens. This may result in unexpected larger KV cache.")
 
@@ -170,15 +170,16 @@ class SparseAttention(torch.nn.Module):
         """
 
         # check heads
-        hdim = 3 - self.seq_dim if q.dim() == 4 else 1
+        seq_dim = self.seq_dim or 1
+        hdim = 3 - (seq_dim or 1) if q.dim() == 4 else 1
         assert self.layout_csr_crow.size(0) in [1, k.size(hdim), q.size(hdim)], \
             (f"Input (q, k) have ({q.size(hdim)}, {k.size(hdim)}) heads"
              f"but the number of heads in the sparse pattern is {self.layout_csr_crow.size(0)}")
 
         # check seqlen
         if q.dim() == 4:
-            assert k.size(self.seq_dim) <= self.max_seqlen, \
-                (f"Input length {k.size(self.seq_dim)} is larger "
+            assert k.size(seq_dim) <= self.max_seqlen, \
+                (f"Input length {k.size(seq_dim)} is larger "
                  f"than the maximum length allowed ({self.max_seqlen})")
 
         sm_scale = sm_scale or 1. / math.sqrt(float(q.size(-1)))

@@ -472,8 +472,3 @@ def print_diff_stats(ref, tri):
             f'.. {ref.abs().mean().item()=},\n'
             f'.. {(ref - tri).abs().ravel().topk(10).values=}')
     return (msg)
-
-# test_inference_padding_varlen()
-# test_dims_and_dtype()
-# test_inference_no_padding()
-# test_sparse_block_sizes()
