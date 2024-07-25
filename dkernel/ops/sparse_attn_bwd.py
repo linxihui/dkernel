@@ -6,8 +6,6 @@ from typing import Tuple, Optional
 from torch import Tensor
 from dkernel.utils import multiple_of, is_hip
 
-import ipdb
-_b = ipdb.set_trace
 
 """
 @linxihui
@@ -521,8 +519,11 @@ configs_bwd = [
         "EVEN_N2_BLOCK": lambda kwargs: kwargs["N_CTX"] % kwargs["BLOCK_N2"] == 0,
         "N_CTX_FOR_AUTOTUNE": lambda kwargs: triton.next_power_of_2(kwargs["N_CTX"]),
     })
-@triton.autotune(configs_bwd, key=["N_CTX_FOR_AUTOTUNE", "BLOCK_DMODEL", "NUM_DBLOCKS",
-                                   "BLOCK_M", "BLOCK_N", "BLOCK_M2", "BLOCK_N2"])
+@triton.autotune(
+    configs_bwd,
+    key=["N_CTX_FOR_AUTOTUNE", "BLOCK_DMODEL", "NUM_DBLOCKS",
+        "BLOCK_M", "BLOCK_N", "BLOCK_M2", "BLOCK_N2"]
+    )
 @triton.jit
 def _bwd_kernel(
     Q, K, V, sm_scale,
@@ -695,11 +696,6 @@ def _backward(ctx,
         num_seq_blocks = num_m_block_for_dq + triton.cdiv(qlen, dk_block_m)
 
     grid = (num_seq_blocks, grid[1])
-
-    if int(os.environ.get("BS_DEBUG", '0')):
-        print(f'>> {ctx.kwargs=}, {q.shape=}, {grid=}')
-        _b()
-
     rounded_ctx = delta.size(-1)
 
     _bwd_kernel[grid](

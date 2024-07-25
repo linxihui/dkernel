@@ -3,7 +3,7 @@ from torch import Tensor
 from typing import Tuple, Dict, Optional, Union
 from dkernel.ops.sparse_attn_fwd import _forward
 from dkernel.ops.sparse_attn_bwd import _backward
-from dkernel.ops.sparse_attn_inference import padded_sparse_attn, varlen_pparse_attn
+from dkernel.ops.sparse_attn_inference import padded_sparse_attn, varlen_sparse_attn
 
 
 class _sparse_attention(torch.autograd.Function):
@@ -28,6 +28,7 @@ class _sparse_attention(torch.autograd.Function):
         ctx.layout_csr = layout_csr
         ctx.layout_csc = layout_csc
         seq_dim = 1 if seq_dim is None else seq_dim
+        max_seqlen = kwargs.get("max_seqlen", None)
 
         assert q.dim() in (3, 4)
         # need_backwards = q.requires_grad() or k.requires_grad() or v.requires_grad()
@@ -36,11 +37,14 @@ class _sparse_attention(torch.autograd.Function):
             assert inf_kwargs.get("cu_seqlen_k", None) is not None
             ctx.support_backward = False
             ctx.message = "Currently does not suppoort variable length inputs. WIP."
-            return varlen_pparse_attn(q, k, v,
+            num_heads = q.size(1)
+            num_kv_heads = k.size(1)
+            return varlen_sparse_attn(q, k, v,
                                       inf_kwargs["cu_seqlen_k"],
                                       inf_kwargs.get("cu_seqlen_q", None),
                                       sm_scale,
-                                      layout_csr)
+                                      layout_csr,
+                                      max_seqlen=max_seqlen)
         else:
             left_paddings = inf_kwargs.get("left_paddings", None)
             seqlens =  inf_kwargs.get("seqlens", None)
@@ -54,10 +58,12 @@ class _sparse_attention(torch.autograd.Function):
                                           layout_csr,
                                           left_paddings=left_paddings,
                                           seqlens=seqlens,
-                                          seq_dim=seq_dim)
+                                          seq_dim=seq_dim,
+                                          max_seqlen=max_seqlen)
             else:
                 ctx.support_backward = True
                 ctx.message = ""
+                assert k.size(seq_dim) <= max_seqlen
                 return _forward(ctx, q, k, v, sm_scale, layout_csr, seq_dim=seq_dim, **kwargs)
 
     @staticmethod

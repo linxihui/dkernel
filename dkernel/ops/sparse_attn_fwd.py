@@ -5,9 +5,6 @@ from torch import Tensor
 from typing import Tuple, Optional
 from dkernel.utils import multiple_of, is_hip
 
-import ipdb
-_b = ipdb.set_trace
-
 
 @triton.jit
 def _fwd_one_kv_block(
@@ -44,7 +41,8 @@ def _fwd_one_kv_block(
     qk *= sm_scale
 
     if MERGED_Q:
-        qk += tl.where(tl.arange(0, BLOCK_M)[:, None] < micro_M, 0, -1e6)
+        within_block_offset = PAST_LEN % BLOCK_M
+        qk += tl.where(tl.arange(0, BLOCK_M)[:, None] < micro_M - within_block_offset, 0, -1e6)
     if CAUSAL & LAST_N_BLOCK:
         qk += tl.where(offs_m[:, None] + PAST_LEN >= (start_n + offs_n[None, :]), 0, -1e6)
 
@@ -83,10 +81,11 @@ fwd_configs = [
 ]
 
 
-@triton.autotune(fwd_configs,
-                 key=["N_CTX_FOR_AUTOTUNE", "BLOCK_DMODEL", "NUM_DBLOCKS",
-                      "BLOCK_M", "BLOCK_N", "Q_ROUNDED_LEN"]
-                )
+@triton.autotune(
+        fwd_configs,
+        key=["N_CTX_FOR_AUTOTUNE", "BLOCK_DMODEL", "NUM_DBLOCKS",
+            "BLOCK_M", "BLOCK_N", "Q_ROUNDED_LEN"]
+            )
 @triton.jit
 def _fwd_kernel(
     Q, K, V, sm_scale,
@@ -263,7 +262,8 @@ def _forward(ctx,
             seq_dim: int=1,
             inference: Optional[bool]=None,
             out:Optional[Tensor]=None,
-            d_splits: Optional[int]=None
+            d_splits: Optional[int]=None,
+            max_seqlen: Optional[int]=None,
             ) -> Tensor:
     """
     :param q, k, v: shape=(batch, n_heads, seq_len, head_size) if seq_len=2 else (batch, seq_len, n_heads, head_size).
@@ -277,6 +277,7 @@ def _forward(ctx,
     :param inference: if at inference mode, i.e., do not save addition info needed in the backward pass.
     :param out: if provided, output will be saved to.
     :param d_splits: None, 1 or 2.  None=1 if head_dim=64 else 2.
+    :param max_seqlen: used for checking input seqlen
     """
     assert seq_dim in [2, 1]
     hdim = 3 - seq_dim
@@ -288,6 +289,8 @@ def _forward(ctx,
     qlen, klen = q.size(seq_dim), k.size(seq_dim)
     num_heads, num_kv_heads = q.size(hdim), k.size(hdim)
 
+    if max_seqlen is not None:
+        assert klen <= max_seqlen
 
     num_head_patterns = layout_crow_indices.size(0)
     if num_head_patterns > 1:
@@ -299,7 +302,7 @@ def _forward(ctx,
         # assert klen > qlen
         assert qlen == 1, \
             ("If q has differnt seq length that k and v, q should only have 1 token per batch for decoding,"
-             f"but got q length = {qlen}.")
+            f"but got q length = {qlen}.")
         layout_crow_indices = layout_crow_indices[..., (klen - qlen) // block_m:]
 
     # TODO: do I need to set o.requires_grad to True explicitely?

@@ -4,7 +4,7 @@ import triton.language as tl
 from torch import Tensor
 from typing import Tuple, Optional
 from dkernel.utils import is_hip
-
+import os
 
 
 def padded_sparse_attn(
@@ -16,8 +16,11 @@ def padded_sparse_attn(
     *,
     left_paddings: Optional[Tensor] = None,
     seqlens: Optional[Tensor] = None,
-    max_seqlen: Optional[int]= None,
+    max_seqlen: Optional[int] = None,
     seq_dim: int = 1,
+    d_splits: Optional[int] = None,
+    out: Optional[Tensor] = None,
+    inference: bool = True
 ):
     """
     :param q, k, v: (batch, seqlen, num_heads/num_kv_heads, head_size) if seq_dim = 1 (default),
@@ -29,47 +32,47 @@ def padded_sparse_attn(
             No need to specify if left_paddings is used.
     :param max_seqlen:
     :param seq_dim:
+    :param d_splits:
+    ;param out:
+    :param inference: not used. just for compatibility
     """
 
     assert seq_dim in (1, 2)
     hdim = 3 - seq_dim
 
     batches, _, _, head_size = q.shape
-    q_len, k_len = q.size(seq_dim), k.size(hdim)
+    q_len, k_len = q.size(seq_dim), k.size(seq_dim)
     num_heads, num_kv_heads = q.size(hdim), k.size(hdim)
 
     assert q.dim() == k.dim() == v.dim() == 4
     assert num_heads % num_kv_heads == 0
     assert q.size(0) == k.size(0) and q.size(3) == k.size(3)
-    assert k.shape == v.shape # TODO: allow diff head_size for k, v
+    assert k.shape == v.shape  # TODO: allow diff head_size for k, v
     assert q_len == 1 or q_len == k_len, \
-        f'q length can only 1 for decoding for same as k length for prefilling.'
+        (f'q length can only 1 for decoding or the same as k length for prefilling, '
+         f'but got {q_len=}, {k_len=}.')
     q_k_ratio = num_heads // num_kv_heads
+
+    assert d_splits in [None, 1, 2]
+    if d_splits is None:
+        d_splits = 2 if head_size > 64 else 1
 
     if max_seqlen:
         assert k.size(seq_dim) <= max_seqlen, \
             f'k has seqlen {k.size(seq_dim)} while max sequence length is set to {max_seqlen}.'
 
-    layout_crow_indices, layout_col_indices, block_m, block_n = sparse_layout
+    layout_crow, layout_col, block_m, block_n = sparse_layout
 
     # paddings always has zero output, a little slower than using empty
-    out = q.new_zeros(q.shape)
-                                                                                               
-    block_d = triton.next_power_of_2(head_size)
-
-    # k_batch_range = torch.zeros((batches, 2), dtype=torch.int32, device=q.device)
-    # if left_paddings is not None:
-    #     k_batch_range[:, 0].copy_(left_paddings)
-    # if seqlens is not None:
-    #     k_batch_range[:, 1].copy_(seqlens + k_batch_range[:, 0])
-    # else:
-    #     k_batch_range[:, ]
+    out = out if out is not None else q.new_zeros(q.shape)
 
     if left_paddings is not None:
         assert left_paddings.shape == (batches,)
-        k_batch_starts = left_paddings.to(q.device, dtype=torch.int32).contiguous()
+        k_batch_starts = left_paddings.to(
+            q.device, dtype=torch.int32).contiguous()
     else:
-        k_batch_starts = torch.zeros((batches,), dtype=torch.int32, device=q.device)
+        k_batch_starts = torch.zeros(
+            (batches,), dtype=torch.int32, device=q.device)
 
     if seqlens is not None:
         k_batch_ends = k_batch_starts + seqlens.type_as(k_batch_starts)
@@ -89,65 +92,62 @@ def padded_sparse_attn(
     n_blocks = (q_lens + block_m - 1) // block_m
 
     q_batch_ids = torch.tensor([i for i, n in enumerate(n_blocks) for _ in range(n)],
-                                dtype=q_batch_starts.dtype,
-                                device=q_batch_starts.device)
-    q_start_sids = torch.tensor([i * block_m for n in n_blocks for i in range(n)],
                                dtype=q_batch_starts.dtype,
                                device=q_batch_starts.device)
+    q_start_sids = torch.tensor([i * block_m for n in n_blocks for i in range(n)],
+                                dtype=q_batch_starts.dtype,
+                                device=q_batch_starts.device)
 
-    MERGED_Q = False
-    if layout_col_indices.dim() == 3:
-        assert layout_col_indices.size(2) == 2 and layout_col_indices.stride(
+    merged_q = False
+    if layout_col.dim() == 3:
+        assert layout_col.size(2) == 2 and layout_col.stride(
             2) == 1
-        MERGED_Q = True
+        merged_q = True
 
-    NUM_DIAG_BLOCKS = max(1, block_m // block_n)
-
-    # block_d = 64 if head_size > 64 else triton.next_power_of_2(head_size)
-    d_splits = 2 if head_size > 64 else 1
+    num_diag_blocks = max(1, block_m // block_n)
     block_d = triton.next_power_of_2(triton.cdiv(head_size, d_splits))
-    even_d = head_size % (d_splits * block_d) == 0
+    even_d = head_size == d_splits * block_d
 
     grid = (len(q_start_sids), num_heads)
 
     _fwd_kernel_batch_inference[grid](
-    q, k, v, out,
-    sm_scale,
-    q_batch_starts,
-    q_batch_ends,
-    k_batch_starts,
-    k_batch_ends,
-    q_batch_ids,
-    q_start_sids,
+        q, k, v, out,
+        sm_scale,
+        q_batch_starts,
+        q_batch_ends,
+        k_batch_starts,
+        k_batch_ends,
+        q_batch_ids,
+        q_start_sids,
 
-    *q.stride(),
-    *k.stride(),
-    *v.stride(),
-    *out.stride(),
+        q.stride(0), q.stride(seq_dim), q.stride(hdim), q.stride(3),
+        k.stride(0), k.stride(seq_dim), k.stride(hdim), k.stride(3),
+        v.stride(0), v.stride(seq_dim), v.stride(hdim), v.stride(3),
+        out.stride(0), out.stride(seq_dim), out.stride(hdim), out.stride(3),
 
-    layout_crow_indices,
-    layout_col_indices,
-    *layout_crow_indices.stride(),
-    *layout_col_indices.stride(),
+        layout_crow,
+        layout_col,
+        *layout_crow.stride(),
+        *layout_col.stride()[:2],
 
-    q_k_ratio,
-    MAX_K_LEN = (k_batch_ends - k_batch_starts).max().item(),
-    HAS_BATCH_DIM = True,
-    D_HEAD = head_size,
-    BLOCK_M = block_n,
-    BLOCK_N = block_n,
-    BLOCK_D = block_d,
-    NUM_DBLOCKS=d_splits,
-    BLOCK_M_LOADING = 16 if q_len == 1 else block_n, # smaller for decoding
-    EVEN_D = even_d,
-    MERGED_Q=MERGED_Q,
-    NUM_DIAG_BLOCKS=NUM_DIAG_BLOCKS,
+        q_k_ratio,
+        MAX_K_LEN=(k_batch_ends - k_batch_starts).max().item(),
+        HAS_BATCH_DIM=True,
+        D_HEAD=head_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        NUM_DBLOCKS=d_splits,
+        BLOCK_M_LOADING=16 if q_len == 1 else block_m,  # smaller for decoding
+        EVEN_D=even_d,
+        MERGED_Q=merged_q,
+        NUM_DIAG_BLOCKS=num_diag_blocks,
     )
 
     return out
-    
 
-def varlen_pparse_attn(
+
+def varlen_sparse_attn(
         q: Tensor,
         k: Tensor,
         v: Tensor,  # (total_num_tokens, num_heads, head_size)
@@ -156,11 +156,15 @@ def varlen_pparse_attn(
         sm_scale: int,
         sparse_layout: Tuple[Tensor, Tensor, int, int],
         *,
-        max_seqlen: int=None):
+        max_seqlen: int = None,
+        d_splits: Optional[int] = None,
+        out: Optional[Tensor] = None,
+        inference: bool = True
+        ):
     # split q to blocks
 
     assert isinstance(sparse_layout, (list, tuple))
-    layout_crow_indices, layout_col_indices, block_m, block_n = sparse_layout
+    layout_crow, layout_col, block_m, block_n = sparse_layout
 
     _, num_heads, head_size = q.shape
     batch_size = cu_seqlens_k.size(0) - 1
@@ -173,6 +177,10 @@ def varlen_pparse_attn(
     assert cu_seqlens_k.dim() == 1
 
     q_k_ratio = q.size(1) // k.size(1)
+
+    assert d_splits in [None, 1, 2]
+    if d_splits is None:
+        d_splits = 2 if head_size > 64 else 1
 
     if cu_seqlens_q is None:
         if q.size(0) == batch_size:  # decoding only
@@ -219,24 +227,20 @@ def varlen_pparse_attn(
         device=cu_seqlens_q.device,
     )
 
-    out = q.new_empty(q.shape)
+    out = out if out is not None else q.new_empty(q.shape)
 
     decoding_only = (q_lens == 1).all().item()
 
-    MERGED_Q = False
-    if layout_col_indices.dim() == 3:
-        assert layout_col_indices.size(2) == 2 and layout_col_indices.stride(
+    merged_q = False
+    if layout_col.dim() == 3:
+        assert layout_col.size(2) == 2 and layout_col.stride(
             2) == 1
-        MERGED_Q = True
+        merged_q = True
 
-    NUM_DIAG_BLOCKS = max(1, block_m // block_n)
-
-    # block_d = 64 if head_size > 64 else triton.next_power_of_2(head_size)
-    d_splits = 2 if head_size > 64 else 1
+    num_diag_blocks = max(1, block_m // block_n)
     block_d = triton.next_power_of_2(triton.cdiv(head_size, d_splits))
     even_d = head_size % (d_splits * block_d) == 0
-
-    grid = (len(q_start_sids), num_heads, 1)
+    grid = (len(q_start_sids), num_heads)
 
     _fwd_kernel_batch_inference[grid](
         q,
@@ -258,10 +262,11 @@ def varlen_pparse_attn(
         *v.stride(),
         0,
         *out.stride(),
-        layout_crow_indices,
-        layout_col_indices,
-        *layout_crow_indices.stride(),
-        *layout_col_indices.stride()[:2],
+        layout_crow,
+        layout_col,
+        *layout_crow.stride(),
+        *layout_col.stride()[:2],
+
         q_k_ratio,
         MAX_K_LEN=max_k_len,
         HAS_BATCH_DIM=False,
@@ -273,8 +278,8 @@ def varlen_pparse_attn(
         EVEN_D=even_d,
         BLOCK_M_LOADING=(16 if decoding_only else
                          block_m),  # smaller for decoding
-        MERGED_Q=MERGED_Q,
-        NUM_DIAG_BLOCKS=NUM_DIAG_BLOCKS,
+        MERGED_Q=merged_q,
+        NUM_DIAG_BLOCKS=num_diag_blocks,
         # num_warps=1 if decoding_only else 4,
         # num_stages=3
     )
@@ -290,7 +295,7 @@ def _fwd_kernel_inner(
     m_i,
     q,
     q2,
-    Q,
+    dtype,
     k_block_col_idx,
     layout_col_ptr,
     layout_col_stride_h,
@@ -310,6 +315,7 @@ def _fwd_kernel_inner(
     past_len,
     LAST_K_BLOCK: tl.constexpr,
     BLOCK_M_LOADING: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     D_HEAD: tl.constexpr,
@@ -319,76 +325,50 @@ def _fwd_kernel_inner(
     MERGED_Q: tl.constexpr,
 ):
 
+    k_block_id = tl.load(layout_col_ptr + off_h * layout_col_stride_h +
+                         k_block_col_idx * layout_col_stride_m).to(tl.int32)
     if MERGED_Q:
-        k_block_id = tl.load(layout_col_ptr + off_h * layout_col_stride_h +
-                             k_block_col_idx * layout_col_stride_m).to(
-                                 tl.int32)
         micro_M = tl.load(layout_col_ptr + off_h * layout_col_stride_h +
-                          k_block_col_idx * layout_col_stride_m + 1).to(
-                              tl.int32)
-
+                          k_block_col_idx * layout_col_stride_m + 1).to(tl.int32)
     else:
-        k_block_id = tl.load(layout_col_ptr + off_h * layout_col_stride_h +
-                             k_block_col_idx * layout_col_stride_m).to(
-                                 tl.int32)
-        micro_M = 0
+        micro_M = BLOCK_M_LOADING
 
     start_n = k_block_id * BLOCK_N
-    k2 = 0
+    k_ptrs = k_ptrs + start_n * stride_kt
+
     if LAST_K_BLOCK:
         if EVEN_D:
-            k = tl.load(
-                k_ptrs + start_n * stride_kt,
-                mask=offs_n[None, :] + start_n < k_seqlen,
-            )
-            if NUM_DBLOCKS > 1:
-                k2 = tl.load(
-                    k_ptrs + start_n * stride_kt + BLOCK_D * stride_kd,
-                    mask=offs_n[None, :] + start_n < k_seqlen,
-                )
+            mask = offs_n[None, :] + start_n < k_seqlen
         else:
-            k = tl.load(
-                k_ptrs + start_n * stride_kt,
-                mask=(offs_n[None, :] + start_n < k_seqlen) &
-                (offs_d[:, None] < D_HEAD),
-            )
-            if NUM_DBLOCKS > 1:
-                k2 = tl.load(
-                    k_ptrs + start_n * stride_kt + BLOCK_D * stride_kd,
-                    mask=(offs_n[None, :] + start_n < k_seqlen) &
-                    (offs_d[:, None] + BLOCK_D < D_HEAD),
-                )
+            mask = ((offs_n[None, :] + start_n < k_seqlen) &
+                    (offs_d[:, None] < D_HEAD))
     else:
         if EVEN_D:
-            k = tl.load(k_ptrs + start_n * stride_kt)
-            if NUM_DBLOCKS > 1:
-                k2 = tl.load(k_ptrs + start_n * stride_kt +
-                             BLOCK_D * stride_kd)
+            mask = None
         else:
-            k = tl.load(k_ptrs + start_n * stride_kt,
-                        mask=offs_d[:, None] < D_HEAD)
-            if NUM_DBLOCKS > 1:
-                k2 = tl.load(k_ptrs + start_n * stride_kt +
-                             BLOCK_D * stride_kd,
-                             mask=offs_d[:, None] + BLOCK_D < D_HEAD)
+            mask = offs_d[:, None] + BLOCK_D < D_HEAD
 
+    k = tl.load(k_ptrs, mask=mask)
     qk = tl.zeros([BLOCK_M_LOADING, BLOCK_N], dtype=tl.float32)
     qk += tl.dot(q, k)
 
     if NUM_DBLOCKS > 1:
-        qk += tl.dot(q2, k2)
+        k = tl.load(k_ptrs + BLOCK_D * stride_kd, mask=mask)
+        qk += tl.dot(q2, k)
+
     qk *= sm_scale
 
     if MERGED_Q:
+        within_block_offset = past_len % BLOCK_M
         qk += tl.where(
-            tl.arange(0, BLOCK_M_LOADING)[:, None] < micro_M, 0, float("-inf"))
+            tl.arange(0, BLOCK_M_LOADING)[:, None] < micro_M - within_block_offset, 0, -1e6)
 
     # the following is needed only when LAST_K_BLOCK or BLOCK_M < BLOCK_N
     if LAST_K_BLOCK | M_LT_N:
         qk += tl.where(
             offs_m[:, None] + past_len >= (start_n + offs_n[None, :]),
             0,
-            float("-inf"),
+            -1e6,
         )
 
     # flash-attn2
@@ -401,61 +381,33 @@ def _fwd_kernel_inner(
     m_i = m_ij
     l_i = l_i * alpha + l_ij
 
-    p = p.to(Q.dtype.element_ty)
-    # update acc
-    v2 = 0
-    if LAST_K_BLOCK:
-        if EVEN_D:
-            v = tl.load(
-                v_ptrs + start_n * stride_vt,
-                mask=offs_n[:, None] + start_n < k_seqlen,
-            )
-        else:
-            v = tl.load(
-                v_ptrs + start_n * stride_vt,
-                mask=(offs_n[:, None] + start_n < k_seqlen) &
-                (offs_d[None, :] < D_HEAD),
-            )
-    else:
-        if EVEN_D:
-            v = tl.load(v_ptrs + start_n * stride_vt)
-        else:
-            v = tl.load(v_ptrs + start_n * stride_vt,
-                        mask=offs_d[None, :] < D_HEAD)
+    p = p.to(dtype)
+    v_ptrs = v_ptrs + start_n * stride_vt
+    v = tl.load(v_ptrs, mask=mask)
 
-    acc += tl.dot(p, v)
+    # update acc
+    acc += tl.dot(p, tl.trans(v))
 
     if NUM_DBLOCKS > 1:
-        if LAST_K_BLOCK:
-            if EVEN_D:
-                v2 = tl.load(
-                    v_ptrs + start_n * stride_vt + BLOCK_D * stride_vd,
-                    mask=offs_n[:, None] + start_n < k_seqlen,
-                )
-            else:
-                v2 = tl.load(
-                    v_ptrs + start_n * stride_vt + BLOCK_D * stride_vd,
-                    mask=(offs_n[:, None] + start_n < k_seqlen) &
-                    (offs_d[None, :] + BLOCK_D < D_HEAD),
-                )
-        else:
-            if EVEN_D:
-                v2 = tl.load(v_ptrs + start_n * stride_vt +
-                             BLOCK_D * stride_vd)
-            else:
-                v2 = tl.load(v_ptrs + start_n * stride_vt +
-                             BLOCK_D * stride_vd,
-                             mask=offs_d[None, :] + BLOCK_D < D_HEAD)
-        acc2 += tl.dot(p, v2)
+        acc2 = acc2 * alpha[:, None]
+        v = tl.load(v_ptrs + BLOCK_D * stride_vd, mask=mask)
+        acc2 += tl.dot(p, tl.trans(v))
 
     return acc, acc2, l_i, m_i
 
 
-fwd_configs = [
-    triton.Config({}, num_stages=s, num_warps=w) \
-    for s in ([1] if is_hip() else [1, 2, 3, 5, 7]) \
-    for w in [1, 2, 4, 8] \
-]
+if int(os.environ.get("DKERNEL_DEBUG", "0")) == 1:
+    fwd_configs = [
+        triton.Config({}, num_stages=s, num_warps=w)
+        for s in ([1] if is_hip() else [1])
+        for w in [1]
+    ]
+else:
+    fwd_configs = [
+        triton.Config({}, num_stages=s, num_warps=w)
+        for s in ([1] if is_hip() else [1, 2, 3, 5, 7])
+        for w in [1, 2, 4, 8]
+    ]
 
 
 @triton.heuristics({
@@ -510,7 +462,7 @@ def _fwd_kernel_batch_inference(
     HAS_BATCH_DIM: tl.constexpr,
     D_HEAD: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,  
+    BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     NUM_DBLOCKS: tl.constexpr,
     BLOCK_M_LOADING: tl.constexpr,
@@ -534,19 +486,15 @@ def _fwd_kernel_batch_inference(
     off_h = tl.program_id(1)
 
     off_h_for_kv = off_h // q_k_ratio
+    off_z = tl.load(q_batch_ids + off_zm).to(tl.int32)
+    q_start_sid = tl.load(q_start_sids + off_zm)
+    start_m = q_start_sid // BLOCK_M
 
     if HAS_BATCH_DIM:
-        off_z = tl.program_id(2)
         Q += off_z * stride_qb
         K += off_z * stride_kb
         V += off_z * stride_vb
         Out += off_z * stride_ob
-        start_m = off_zm
-        q_start_sid = start_m * BLOCK_M  # always 0 for decoding
-    else:
-        off_z = tl.load(q_batch_ids + off_zm).to(tl.int32)  # [0, 0, 0, 1]
-        q_start_sid = tl.load(q_start_sids + off_zm)
-        start_m = q_start_sid // BLOCK_M  # q_sbid
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M_LOADING)
     offs_n = tl.arange(0, BLOCK_N)
@@ -567,37 +515,18 @@ def _fwd_kernel_batch_inference(
     q_ptrs = Q + offs_m[:, None] * stride_qt + offs_d[None, :] * stride_qd
 
     if EVEN_D:
-        q = tl.load(
-            q_ptrs,
-            mask=offs_m[:, None] < q_seqlen,
-        )
-        q2 = 0
-        if NUM_DBLOCKS > 1:
-            q2 = tl.load(
-                q_ptrs + BLOCK_D * stride_qd,
-                mask=offs_m[:, None] < q_seqlen,
-            )
+        mask = offs_m[:, None] < q_seqlen
     else:
-        q = tl.load(
-            q_ptrs,
-            mask=(offs_m[:, None] < q_seqlen) & (offs_d[None, :] < D_HEAD),
-            other=0,
-        )
-        q2 = 0
-        if NUM_DBLOCKS > 1:
-            q2 = tl.load(
-                q_ptrs + BLOCK_D * stride_qd,
-                mask=(offs_m[:, None] < q_seqlen) &
-                (offs_d[None, :] + BLOCK_D) < D_HEAD,
-            )
+        mask = (offs_m[:, None] < q_seqlen) & (offs_d[None, :] < D_HEAD)
+
+    q = tl.load(q_ptrs, mask=mask)
+    q2 = 0
+    if NUM_DBLOCKS > 1:
+        q2 = tl.load(q_ptrs + BLOCK_D * stride_qd, mask=mask)
 
     sparse_crow_ptr = (layout_crow_ptr + off_h * layout_crow_stride_h +
                        q_pbid * layout_crow_stride_m)
-
-    # TODO(linxihui): load at once, with any Triton version
-    # that supports `tl.split`, e.g., Triton 3.0
-    k_block_start = tl.load(sparse_crow_ptr).to(tl.int32)
-    k_block_end = tl.load(sparse_crow_ptr + 1).to(tl.int32)
+    k_block_start, k_block_end = tl.load(sparse_crow_ptr + tl.arange(0, 2)).split()
 
     m_i = tl.zeros([BLOCK_M_LOADING], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M_LOADING], dtype=tl.float32)
@@ -607,29 +536,28 @@ def _fwd_kernel_batch_inference(
         acc2 = tl.zeros([BLOCK_M_LOADING, BLOCK_D], dtype=tl.float32)
 
     k_ptrs = K + offs_n[None, :] * stride_kt + offs_d[:, None] * stride_kd
-    v_ptrs = V + offs_n[:, None] * stride_vt + offs_d[None, :] * stride_vd
+    # v_ptrs = V + offs_n[:, None] * stride_vt + offs_d[None, :] * stride_vd
+    v_ptrs = V + offs_n[None, :] * stride_vt + offs_d[:, None] * stride_vd
 
     sm_scale *= (
         1.44269504  # 1/log2 as we use base2 for exponential and logarithm
     )
 
     non_diag_end = tl.maximum(k_block_end - NUM_DIAG_BLOCKS, k_block_start)
-    # for col_idx_idx in range(k_block_start, non_diag_end):
-
     for k_block_col_idx in range(k_block_start, non_diag_end):
         acc, acc2, l_i, m_i = _fwd_kernel_inner(
-            acc, acc2, l_i, m_i, q, q2, Q, k_block_col_idx, layout_col_ptr,
+            acc, acc2, l_i, m_i, q, q2, Q.dtype.element_ty, k_block_col_idx, layout_col_ptr,
             layout_col_stride_h, layout_col_stride_m, k_ptrs, v_ptrs, off_h,
             offs_m, offs_n, offs_d, stride_kt, stride_kd, stride_vt, stride_vd,
-            sm_scale, k_seqlen, past_len, False, BLOCK_M_LOADING, BLOCK_N,
+            sm_scale, k_seqlen, past_len, False, BLOCK_M_LOADING, BLOCK_M, BLOCK_N,
             BLOCK_D, D_HEAD, NUM_DBLOCKS, EVEN_D, M_LT_N, MERGED_Q)
 
     for k_block_col_idx in range(non_diag_end, k_block_end):
         acc, acc2, l_i, m_i = _fwd_kernel_inner(
-            acc, acc2, l_i, m_i, q, q2, Q, k_block_col_idx, layout_col_ptr,
+            acc, acc2, l_i, m_i, q, q2, Q.dtype.element_ty, k_block_col_idx, layout_col_ptr,
             layout_col_stride_h, layout_col_stride_m, k_ptrs, v_ptrs, off_h,
             offs_m, offs_n, offs_d, stride_kt, stride_kd, stride_vt, stride_vd,
-            sm_scale, k_seqlen, past_len, True, BLOCK_M_LOADING, BLOCK_N,
+            sm_scale, k_seqlen, past_len, True, BLOCK_M_LOADING, BLOCK_M, BLOCK_N,
             BLOCK_D, D_HEAD, NUM_DBLOCKS, EVEN_D, M_LT_N, MERGED_Q)
 
     # flash-attn 2
@@ -638,31 +566,8 @@ def _fwd_kernel_batch_inference(
 
     # write output
     out_ptrs = Out + offs_m[:, None] * stride_ot + offs_d[None, :] * stride_od
-    if EVEN_D:
-        tl.store(
-            out_ptrs,
-            acc,
-            mask=offs_m[:, None] < q_seqlen,
-        )
-    else:
-        tl.store(
-            out_ptrs,
-            acc,
-            mask=(offs_m[:, None] < q_seqlen) & (offs_d[None, :] < D_HEAD),
-        )
+    tl.store(out_ptrs, acc, mask=mask)
 
     if NUM_DBLOCKS > 1:
         acc2 = acc2 / l_i[:, None]
-        if EVEN_D:
-            tl.store(
-                out_ptrs + BLOCK_D * stride_od,
-                acc2,
-                mask=offs_m[:, None] < q_seqlen,
-            )
-        else:
-            tl.store(
-                out_ptrs + BLOCK_D * stride_od,
-                acc2,
-                mask=(offs_m[:, None] < q_seqlen) &
-                (offs_d[None, :] + BLOCK_D < D_HEAD),
-            )
+        tl.store(out_ptrs + BLOCK_D * stride_od, acc2, mask=mask)
