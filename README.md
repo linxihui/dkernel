@@ -4,7 +4,11 @@ This repo contains customized CUDA kernel written in OpenAI Triton.
 As of now, it contains the sparse attention kernel used in [phi-3-small models](https://huggingface.co/microsoft/Phi-3-small-8k-instruct).
 This sparse attention is also supported in vLLM for fast inference.
 
-Refernece:
+An illustration of heterogeneous(per head) local-stride block sparse pattern
+![local-stride block-sparse pattern](assets/localstride.png)
+
+Paper: s2attn.
+
 
 # Install
 
@@ -178,7 +182,17 @@ class LocalStrideSparseAttention(SparseAttention):
 
 ```
 
+# Benchmarking
 
+You can run the benchmark script to compare it against FlashAttention and Triton's dense attention.
+
+```sh
+python ./benchmark/benchmark_sparse_attn.py
+```
+
+![](assets/fwd_algorihtm.png) | ![](assets/bwd_algorihtm.png)
+:------:|:--------:
+Forward | Backward
 
 
 # Todo
