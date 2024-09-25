@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Tuple, Optional
 from dkernel.utils import (get_sparse_attn_mask,
                           dense_to_ccol_row,
+                          crow_col_to_dense,
                           multiple_of,
                           is_kv_cache_efficient,
                           verify_sparse_pattern,
@@ -76,11 +77,12 @@ class SparseAttention(torch.nn.Module):
         assert block_size >=16 and math.log2(block_size) % 1 == 0, \
             f"block_size must be power of 2 and at least 16, but {block_size} is given."
 
-        if block_m is None:
-            # TODO: 128?
-            block_m = max(block_size, 64)
+
         if block_n is None:
-            block_n = block_size
+            # should be SRAM dependent, capped at 64 is for most GPUs
+            block_n = min(block_size, 64)
+        if block_m is None:
+            block_m = min((128 * 64) // block_n, 128)
 
         sparse_pattern = sparse_pattern.to(torch.uint8)
         if sparse_pattern.dim() == 2:
@@ -111,18 +113,26 @@ class SparseAttention(torch.nn.Module):
                                     self.block_m,
                                     self.block_n))
         # TODO: method to avoid this for inference?
-        # TODO: need to split on backward for GPUs with less shared memory
+        # TODO: need to split on backward for GPUs with less shared memory, but how to detech SRAM?
         # if self.block_size >= 128:
-        #     self.block_m2 = 32
-        #     self.block_n2 = 128
-        #     layout_csc = list(merge_split_fwd_kernel_blocks(
-        #                                 block_size,
-        #                                 sparse_pattern,
-        #                                 self.block_m2,
-        #                                 self.block_n2))
+        #     # for kv backward
+        #     self.block_n2 = sel
+        #     self.block_m2 = 64
         # else:
-        self.block_m2, self.block_n2 = self.block_size, self.block_size
-        layout_csc = list(dense_to_ccol_row(sparse_pattern, include_values=False))
+        #     # for kv backward
+        self.block_n2 = min(self.block_size, 32) # min(self.block_size, 128) # 32
+        self.block_m2 =  min(128, 128 * 32 // self.block_n2)  # 128
+
+
+        if (self.block_m2 == self.block_size) and (self.block_n2 == self.block_size):
+            layout_csc = list(dense_to_ccol_row(sparse_pattern, include_values=False))
+        else:
+            _layout_csr = list(merge_split_fwd_kernel_blocks(
+                                        block_size,
+                                        sparse_pattern,
+                                        self.block_m2,
+                                        self.block_n2))
+            layout_csc = dense_to_ccol_row(crow_col_to_dense(*_layout_csr))
 
         if layout_csr[0].dim() == 1:
             layout_csr = [x[None] for x in layout_csr]
@@ -174,21 +184,23 @@ class SparseAttention(torch.nn.Module):
         hdim = 3 - (seq_dim or 1) if q.dim() == 4 else 1
         assert self.layout_csr_crow.size(0) in [1, k.size(hdim), q.size(hdim)], \
             (f"Input (q, k) have ({q.size(hdim)}, {k.size(hdim)}) heads"
-             f"but the number of heads in the sparse pattern is {self.layout_csr_crow.size(0)}")
+            f"but the number of heads in the sparse pattern is {self.layout_csr_crow.size(0)}")
 
         # check seqlen
         if q.dim() == 4:
             assert k.size(seq_dim) <= self.max_seqlen, \
                 (f"Input length {k.size(seq_dim)} is larger "
-                 f"than the maximum length allowed ({self.max_seqlen})")
+                f"than the maximum length allowed ({self.max_seqlen})")
 
         sm_scale = sm_scale or 1. / math.sqrt(float(q.size(-1)))
-        inf_kwargs = {"cu_seqlen_k": cu_seqlen_k,
-                      "cu_seqlen_q": cu_seqlen_q,
-                      "left_paddings": left_paddings,
-                      "seqlens": seqlens
-                      }
+        inf_kwargs = {
+                    "cu_seqlen_k": cu_seqlen_k,
+                    "cu_seqlen_q": cu_seqlen_q,
+                    "left_paddings": left_paddings,
+                    "seqlens": seqlens
+                    }
 
+        # print(f'> seqlen={q.size(seq_dim)}: {self.block_m=}, {self.block_n=}, {self.block_m2=}, {self.block_n2=}')
         return _sparse_attention.apply(q, k, v,
                     sm_scale,
                     (self.layout_csr_crow, self.layout_csr_col, self.block_m,  self.block_n),
@@ -197,6 +209,7 @@ class SparseAttention(torch.nn.Module):
                     inf_kwargs,
                     self.kwargs
                     )
+
 
 @lru_cache(maxsize=8)
 class LocalStrideSparseAttention(SparseAttention):

@@ -637,6 +637,8 @@ def _backward(ctx,
     layout_crow_indices, layout_col_indices, dq_block_m, dq_block_n = ctx.layout_csr
     layout_ccol_indices, layout_row_indices, dk_block_m, dk_block_n = ctx.layout_csc
 
+    # print(f'> {dq_block_m=}, {dq_block_n=}, {dk_block_m=}, {dk_block_n=}')
+
     if not do.is_contiguous():
         # TODO: is it necessary to have non-contiguous layout
         do = do.contiguous()

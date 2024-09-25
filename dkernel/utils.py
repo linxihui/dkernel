@@ -67,7 +67,7 @@ def dense_to_crow_col(x: Tensor,
 
 def crow_col_to_dense(crows: Tensor,
                       cols: Tensor,
-                      dtype: torch.dtype=torch.float16
+                      dtype: torch.dtype=torch.int32
                       ) -> Tensor:
     dim = crows.dim()
     if dim == 1:
@@ -82,7 +82,7 @@ def crow_col_to_dense(crows: Tensor,
             if cols.dim() == 2:
                 x[i, j, cols[i, crows[i, j]:crows[i, j+1]]] = 1
             else:
-                x[i, j, cols[i, crows[i, j]:crows[i, j+1], 0]] = cols[i, crows[i, j]:crows[i, j+1], 1]
+                x[i, j, cols[i, crows[i, j]:crows[i, j+1], 0]] = cols[i, crows[i, j]:crows[i, j+1], 1].to(dtype)
     if dim == 1:
         x = x[0]
     return x.to(device)
@@ -97,7 +97,7 @@ def dense_to_ccol_row(x: Tensor, **kwargs) -> Tuple[Tensor, Tensor]:
 
 def ccol_row_to_dense(ccol: Tensor,
                       rows: Tensor,
-                      dtype: torch.dtype=torch.float16
+                      dtype: torch.dtype=torch.int32
                       ) -> Tensor:
     return crow_col_to_dense(ccol, rows, dtype).permute(0, 2, 1).contiguous()
 

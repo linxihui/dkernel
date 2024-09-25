@@ -20,6 +20,16 @@ except BaseException as e:
     print(f'> error to import triton flash_attn: {e=}')
     HAS_DENSE_TRITON_FLASH = False
 
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    flex_attention = torch.compile(flex_attention)
+
+    HAS_FLEX_ATTN = True
+except BaseException as e:
+    print(f'>> flex_attention not available')
+    HAS_FLEX_ATTN = False
+
+
 
 def run_bench(b=4,
               h=16,
@@ -67,10 +77,12 @@ def run_bench(b=4,
         x_vals=[2**i for i in range(10, log2_seqlen + 1)],
         line_arg='provider',
         line_vals=(['triton'] if HAS_DENSE_TRITON_FLASH else []) + \
-                ['triton_sparse'] + (['flash'] if HAS_FLASH else []),
+                ['triton_sparse'] + (['flash'] if HAS_FLASH else []) + \
+                    (['flex-attn'] if HAS_FLEX_ATTN else []),
         line_names=(['Triton-Dense'] if HAS_DENSE_TRITON_FLASH else []) + \
-                [f'Triton-S2 (V={VERT_STRIDE})']+ (['Flash2-Dense'] if HAS_FLASH else []),
-        styles=[('red', '-'), ('blue', '-'), ('green', '-')],
+                [f'Triton-S2 (V={VERT_STRIDE})']+ (['Flash2-Dense'] if HAS_FLASH else []) + 
+                ([f'FlexAttn(V={VERT_STRIDE})'] if HAS_FLEX_ATTN else []),
+        styles=[('red', '-'), ('blue', '-'), ('green', '-'), ('cyan', '-')],
         ylabel='ms',
         plot_name=(f'fused-blocksparse-attention-v2-batch{BATCH}-head{N_HEADS}-d{D_HEAD}'
                     f'-sparse-local{LOCAl_BLOCKS}-vert{VERT_STRIDE}-{sparse_type}'
@@ -128,6 +140,35 @@ def run_bench(b=4,
             return ms
         if provider == 'flash':
             fn = lambda: flash_attn_func(q, k, v, softmax_scale=sm_scale, causal=True)
+            if mode == 'bwd':
+                o = fn()
+                do = torch.randn_like(o)
+                fn = lambda: o.backward(do, retain_graph=True)
+            ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+            return ms
+        
+        if provider == 'flex-attn':
+            if seq_dim == 1:
+                q, k, v = [x.transpose(1, 2) for x in [q, k, v]]
+    
+            h_sliding = 0 if homo_head else 1
+            def _local_vert_stride(b, h, q_idx, kv_idx):
+                q_bid = q_idx // BLOCK_SIZE
+                kv_bid = kv_idx // BLOCK_SIZE
+                locals = ((q_bid - kv_bid) < LOCAl_BLOCKS)
+                vert = (kv_bid + h * h_sliding) % VERT_STRIDE == 0
+                return (q_idx >= kv_idx) & (locals | vert)
+
+            block_mask = create_block_mask(
+                                        _local_vert_stride,
+                                        B=None,
+                                        H=(None if homo_head else H),
+                                        Q_LEN=SEQ_LEN,
+                                        KV_LEN=SEQ_LEN,
+                                        device='cpu',
+                                        ).to(q.device)
+    
+            fn = lambda: flex_attention(q, k, v, block_mask=block_mask)
             if mode == 'bwd':
                 o = fn()
                 do = torch.randn_like(o)
