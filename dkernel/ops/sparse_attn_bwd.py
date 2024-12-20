@@ -422,10 +422,10 @@ def _bwd_kernel_dq(
 
     # loop over rows
     layout_ptr = layout_crow_ptr + off_h * layout_crow_stride_h + start_m * layout_crow_stride_m
-    se = tl.load(layout_ptr + tl.arange(0, 2) * layout_crow_stride_m)
-    start_l, end_l = tl.split(se)
-    # start_l = tl.load(layout_ptr).to(tl.int32)
-    # end_l = tl.load(layout_ptr + layout_crow_stride_m).to(tl.int32)
+    # se = tl.load(layout_ptr + tl.arange(0, 2) * layout_crow_stride_m)
+    # start_l, end_l = tl.split(se)
+    start_l = tl.load(layout_ptr).to(tl.int32)
+    end_l = tl.load(layout_ptr + layout_crow_stride_m).to(tl.int32)
     non_diag_end = tl.maximum(end_l - NUM_DIAG_BLOCKS, start_l)
 
     qk_scale = sm_scale * 1.44269504
