@@ -113,10 +113,14 @@ def get_sparse_attn_mask(num_heads: int,
                          dtype=torch.bfloat16,
                          device=None,
                          return_dense=False,
+                         head_sliding_steps=None,
                          head_sliding_offset=0,
                          num_dense_heads=0):
-    """
+    """Create the crow sparse layout, thhe block mask and the dense mask.
+
     # TODO: with num_kv_heads, make the pattern size (num_kv_heads, m_blocks, n_blocks), instead of (num_heads, ..., )
+    :param head_sliding_steps: default to 1 if num_heads >= vert_stride else int(vert_stride / num_heads).
+    :param head_sliding_offsets:
     :return: a tuple of 3:
         - tuple of crow_indices, col_indices representation of CSR format.
         - block dense mask
@@ -147,6 +151,7 @@ def get_sparse_attn_mask(num_heads: int,
         block_mask = ((q_pos >= k_pos) & ((q_pos - k_pos < local_blocks) | mask_vert_strided)).to(device).to(dtype)
         q_start_block = triton.cdiv(past_len, block_size)
         trimmed_block_mask = block_mask[:, q_start_block:]
+
     if return_dense:
         mask_dense = torch.kron(block_mask, block_mask.new_ones((block_size, block_size)))[..., :seqlen, :seqlen]
         causal_mask = torch.tril(torch.ones(seqlen, seqlen)).type_as(mask_dense)[past_len:]
@@ -156,7 +161,7 @@ def get_sparse_attn_mask(num_heads: int,
         return dense_to_crow_col(trimmed_block_mask), trimmed_block_mask, None
 
     
-def is_kv_cache_friendly(sparse_pattern: Tensor, block_m: int, block_n: int) -> bool:
+def is_kv_cache_efficient(sparse_pattern: Tensor, block_m: int, block_n: int) -> bool:
     """ A sparse pattern is KV cache friendly, when the non-local KV used in generated later tokens
     are also used in generating earlier tokens.
 
@@ -165,9 +170,10 @@ def is_kv_cache_friendly(sparse_pattern: Tensor, block_m: int, block_n: int) -> 
     :param block_n: kernel block_size on k tokens
     """
     # start pos of block > end pos of block, then it is under the
+    sparse_pattern = sparse_pattern.to(torch.int8) # signed
     non_diag = torch.arange(0, sparse_pattern.size(1))[:, None] * block_m >= \
                 torch.arange(1, sparse_pattern.size(2) + 1) * block_n
-    non_diag = non_diag.type_as(sparse_pattern)
+    non_diag = non_diag.to(sparse_pattern.device)
     return (((sparse_pattern[:, 1:] - sparse_pattern[:, :-1]) <= 0) | (~non_diag[1:])).all()
 
 
@@ -176,6 +182,14 @@ def verify_sparse_pattern(sparse_pattern: Tensor) -> None:
     """
     assert sparse_pattern.dim() in (2, 3)
     assert sparse_pattern.size(-2) == sparse_pattern.size(-1)
+    assert is_causal(sparse_pattern), "Only causal attention is supported now."
+
+
+def is_causal(sparse_pattern: Tensor) -> bool:
+    sparse_pattern = sparse_pattern.to(torch.int8)
+    assert sparse_pattern.size(-2) == sparse_pattern.size(-1)
+    sparse_pattern = sparse_pattern * (1 - torch.tril(torch.ones_like(sparse_pattern[0])))
+    return not sparse_pattern.any()
 
 
 def merge_split_fwd_kernel_blocks(block_size: int,
