@@ -177,9 +177,9 @@ def _fwd_kernel(
             q2 = tl.load(q_ptrs + BLOCK_DMODEL * stride_qd, mask=offs_m[:, None] < Q_LEN)
 
     layout_ptr = layout_crow_ptr + off_h * layout_crow_stride_h + start_m * layout_crow_stride_m
-    # start_l = tl.load(layout_ptr).to(tl.int32)
-    # end_l = tl.load(layout_ptr + layout_crow_stride_m).to(tl.int32)
-    start_l, end_l = tl.load(layout_ptr + tl.arange(0, 2) * layout_crow_stride_m).split()
+    start_l = tl.load(layout_ptr).to(tl.int32)
+    end_l = tl.load(layout_ptr + layout_crow_stride_m).to(tl.int32)
+    # start_l, end_l = tl.load(layout_ptr + tl.arange(0, 2) * layout_crow_stride_m).split()
 
     # loop over k, v and update accumulator
     non_diag_end = tl.maximum(end_l - NUM_DIAG_BLOCKS, start_l)
