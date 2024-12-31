@@ -39,13 +39,17 @@ def run_bench(b=4,
               d_splits=None, block_size=64,
               block_m=None, block_n=None,
               support_backward:bool=True,
-              save_path='.',
+              save_path='./benchmark/results/',
               log2_seqlen:int=16,
               num_dense_heads=0,
               homo_head=False,
             #   run_test=True,
               seq_dim=2,
+              bwd_block_sizes=None,
              ):
+    '''
+    bwd_block_sizes: "block_m1,block_n1,block_m2,block_n2"
+    '''
     sparse_type = 'homo' if homo_head else 'hetero'
     dtype = torch.bfloat16
     # d_splits = 2
@@ -72,6 +76,10 @@ def run_bench(b=4,
 
     modes = ['fwd', 'bwd'] if support_backward else ['fwd']
 
+    # if bwd_block_sizes is not None:
+    #     print(f'>> {bwd_block_sizes=}')
+    #     bwd_block_sizes = tuple(int(x) for x in bwd_block_sizes.split(','))
+
     configs = [triton.testing.Benchmark(
         x_names=['SEQ_LEN'],
         x_vals=[2**i for i in range(10, log2_seqlen + 1)],
@@ -86,7 +94,7 @@ def run_bench(b=4,
         ylabel='ms',
         plot_name=(f'fused-blocksparse-attention-v2-batch{BATCH}-head{N_HEADS}-d{D_HEAD}'
                     f'-sparse-local{LOCAl_BLOCKS}-vert{VERT_STRIDE}-{sparse_type}'
-                    f'-dsplit-{d_splits}-{dtype}-{mode}'),
+                    f'-dsplit-{d_splits}-{dtype}-{mode}-fwd{block_m}-{block_n}-bwd{bwd_block_sizes}'),
         args={'H': N_HEADS, 'BATCH': BATCH, 'D_HEAD': D_HEAD, 'dtype': dtype, 'mode': mode}
     ) for mode in modes]
 
@@ -129,7 +137,8 @@ def run_bench(b=4,
                                                             num_dense_heads=num_dense_heads,
                                                             block_m=block_m,
                                                             block_n=block_n,
-                                                            seq_dim=seq_dim)
+                                                            seq_dim=seq_dim,
+                                                            bwd_block_sizes=bwd_block_sizes)
             sparse_attention_fn.to(q.device).to(q.dtype)
             fn = lambda: sparse_attention_fn(q, k, v, sm_scale)
             if mode == 'bwd':

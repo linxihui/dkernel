@@ -526,7 +526,9 @@ def _fwd_kernel_batch_inference(
 
     sparse_crow_ptr = (layout_crow_ptr + off_h * layout_crow_stride_h +
                        q_pbid * layout_crow_stride_m)
-    k_block_start, k_block_end = tl.load(sparse_crow_ptr + tl.arange(0, 2)).split()
+    # k_block_start, k_block_end = tl.load(sparse_crow_ptr + tl.arange(0, 2)).split()
+    k_block_start = tl.load(sparse_crow_ptr)
+    k_block_end = tl.load(sparse_crow_ptr + 1)
 
     m_i = tl.zeros([BLOCK_M_LOADING], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M_LOADING], dtype=tl.float32)

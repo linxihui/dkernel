@@ -58,6 +58,7 @@ def _bwd_preprocess(
 
 @triton.jit
 def _bwd_inner_dkdv(
+    micro_M,
     dk, dv, dk2, dv2,
     k, v, k2, v2,
     Q, DO, m_ptrs, D_ptrs,
@@ -72,6 +73,7 @@ def _bwd_inner_dkdv(
     BLOCK_DMODEL: tl.constexpr,
     NUM_DBLOCKS: tl.constexpr,
     IS_DIAG_BLOCK: tl.constexpr,
+    MERGED_Q: tl.constexpr,
 ):
     # offs_qm = start_m + tl.arange(0, BLOCK_M)
     offs_m_curr = start_m + offs_m
@@ -103,6 +105,9 @@ def _bwd_inner_dkdv(
     else:
         m = tl.load(m_ptrs + offs_m_curr, mask=offs_m_curr < N_CTX)
     p = tl.math.exp2(qk * qk_scale - m[:, None])
+
+    if MERGED_Q:
+        p *= (tl.arange(0, BLOCK_M)[:, None] < micro_M).to(p.dtype)
 
     # compute dv
     if EVEN_M_BLOCK:
@@ -163,6 +168,7 @@ def _bwd_kernel_dkdv(
     EVEN_M_BLOCK: tl.constexpr,
     EVEN_N_BLOCK: tl.constexpr,
     NUM_DBLOCKS: tl.constexpr,
+    MERGED_Q: tl.constexpr,
 ):
     # start_n = tl.program_id(0)
     # off_hz = tl.program_id(1)
@@ -219,17 +225,38 @@ def _bwd_kernel_dkdv(
     end_l = tl.load(layout_ptr + layout_ccol_stride_m).to(tl.int32)
     qk_scale = sm_scale * 1.44269504
 
-    # for seqlen < max_seqlen, need to truncat up to seqlen
-    # can use  max_m_blocks, as this is 'KV cache frendly"
-    max_m_blocks = (N_CTX - start_n * BLOCK_N + BLOCK_M - 1) // BLOCK_M
+    ## for seqlen < max_seqlen, need to truncat up to seqlen
+    ## can use  max_m_blocks, as this is 'KV cache frendly"
+    ## potential problem: when BLOCK_N != BLOCK_M
+
+    start_m_of_n = (start_n * BLOCK_N) // BLOCK_M
+    max_m_blocks = (N_CTX - start_m_of_n * BLOCK_M + BLOCK_M - 1) // BLOCK_M
     end_l = tl.minimum(end_l, start_l + max_m_blocks)
+
+    # sol2?
+    # end_l = tl.minimum(end_l, (N_CTX + BLOCK_M - 1) // BLOCK_M)
+
+    # if start_n == 8:
+    #     tl.device_print('start_l,end_l: ', start_l*1000 + end_l)
+    #     # tl.device_print('')
 
     for row_idx_idx in range(start_l, end_l):
         row_idx = tl.load(layout_row_ptr + off_h * layout_row_stride_h + row_idx_idx * layout_row_stride_m).to(tl.int32)
+
+        if MERGED_Q:
+            micro_M = tl.load(layout_row_ptr + off_h * layout_row_stride_h + row_idx_idx * layout_row_stride_m + 1).to(tl.int32)
+        else:
+            micro_M = BLOCK_M
+
+        # if start_n == 8:
+        #     tl.device_print('row_idx, micro_m:', row_idx_idx*100000 + row_idx * 1000 + micro_M)
+
+        # tl.device_print('Micro_M:', micro_M)
         start_m = row_idx * BLOCK_M
 
         # if start_m < N_CTX:
         dk, dv, dk2, dv2 = _bwd_inner_dkdv(
+            micro_M,
             dk, dv, dk2, dv2,
             k, v, k2, v2,
             Q, DO, m_ptrs, D_ptrs,
@@ -244,6 +271,7 @@ def _bwd_kernel_dkdv(
             BLOCK_DMODEL,
             NUM_DBLOCKS,
             True,
+            MERGED_Q,
         )
 
     # write-back
@@ -422,10 +450,10 @@ def _bwd_kernel_dq(
 
     # loop over rows
     layout_ptr = layout_crow_ptr + off_h * layout_crow_stride_h + start_m * layout_crow_stride_m
-    se = tl.load(layout_ptr + tl.arange(0, 2) * layout_crow_stride_m)
-    start_l, end_l = tl.split(se)
-    # start_l = tl.load(layout_ptr).to(tl.int32)
-    # end_l = tl.load(layout_ptr + layout_crow_stride_m).to(tl.int32)
+    # se = tl.load(layout_ptr + tl.arange(0, 2) * layout_crow_stride_m)
+    # start_l, end_l = tl.split(se)
+    start_l = tl.load(layout_ptr).to(tl.int32)
+    end_l = tl.load(layout_ptr + layout_crow_stride_m).to(tl.int32)
     non_diag_end = tl.maximum(end_l - NUM_DIAG_BLOCKS, start_l)
 
     qk_scale = sm_scale * 1.44269504
@@ -506,10 +534,15 @@ def _bwd_kernel_dq(
 # Does not suuport unequal seqlen(q) and seqlen(k)
 configs_bwd = [
     triton.Config({}, num_stages=s, num_warps=w) \
-    for s in ([1] if is_hip() else [1, 2, 3, 5, 7]) \
-    for w in [4, 8] \
+    for s in ([1] if is_hip() else [1, 2, 3, 5]) \
+    for w in [2, 4, 8] \
 ]
 
+# configs_bwd = [
+#     triton.Config({}, num_stages=s, num_warps=w) \
+#     for s in [1] \
+#     for w in [4] \
+# ]
 
 @triton.heuristics(
     values={
@@ -566,6 +599,7 @@ def _bwd_kernel(
     BLOCK_DMODEL: tl.constexpr,
     NUM_DBLOCKS: tl.constexpr,
     MERGED_Q: tl.constexpr,
+    MERGED_Q_DK: tl.constexpr,
     NUM_DIAG_BLOCKS: tl.constexpr,
 ):
     if (BLOCK_M == BLOCK_N2) | (tl.program_id(0) < NUM_M_BLOCK_FOR_DQ):
@@ -620,6 +654,7 @@ def _bwd_kernel(
             EVEN_M2_BLOCK,
             EVEN_N2_BLOCK,
             NUM_DBLOCKS,
+            MERGED_Q_DK,
         )
 
 
@@ -634,8 +669,11 @@ def _backward(ctx,
     """
     q, k, v, o, l, m = ctx.saved_tensors
 
-    layout_crow_indices, layout_col_indices, dq_block_m, dq_block_n = ctx.layout_csr
-    layout_ccol_indices, layout_row_indices, dk_block_m, dk_block_n = ctx.layout_csc
+    # layout_crow_indices, layout_col_indices, dq_block_m, dq_block_n = ctx.layout_csr
+    # layout_ccol_indices, layout_row_indices, dk_block_m, dk_block_n = ctx.layout_csc
+
+    (layout_crow_indices, layout_col_indices, dq_block_m, dq_block_n), \
+    (layout_ccol_indices, layout_row_indices, dk_block_m, dk_block_n) = ctx.bwd_layout()
 
     # print(f'> {dq_block_m=}, {dq_block_n=}, {dk_block_m=}, {dk_block_n=}')
 
@@ -648,6 +686,7 @@ def _backward(ctx,
         raise ValueError(f'--> output is not contiguous: {o.stride()=}. This is maybe caused by q/k/v not being contiguous.')
 
     if layout_ccol_indices.dim() == 1:
+        # homo
         layout_ccol_indices = layout_ccol_indices[None].expand(q.shape[hdim], -1)
         layout_row_indices = layout_row_indices[None].expand(q.shape[hdim], -1)
 
@@ -688,6 +727,7 @@ def _backward(ctx,
     )
 
     if dq_block_m == dk_block_n:
+        print(f'>> dq and dk computed in sequentially in the same pid.')
         # a pid process dq and dkdv sequentially, this naturally
         # balances the computation of each pid.
         num_m_block_for_dq = 0
@@ -695,10 +735,29 @@ def _backward(ctx,
     else:
         # dq and dkdv are computed in different pid
         num_m_block_for_dq = triton.cdiv(qlen, dq_block_m)
-        num_seq_blocks = num_m_block_for_dq + triton.cdiv(qlen, dk_block_m)
+        num_seq_blocks = num_m_block_for_dq + triton.cdiv(qlen, dk_block_n)
 
     grid = (num_seq_blocks, grid[1])
     rounded_ctx = delta.size(-1)
+
+    merged_q = False
+    if layout_col_indices.dim() == 3:
+        assert layout_col_indices.size(2) == 2 and layout_col_indices.stride(2) == 1
+        merged_q = True
+
+    merged_q_dk = False
+    if layout_row_indices.dim() == 3:
+        assert layout_row_indices.size(2) == 2 and layout_row_indices.stride(2) == 1
+        merged_q_dk = True
+
+    # NOTE: For inference with qlen=1, need to use the origin block_m, as lyaout_col_indices does not get trimmed.
+    kwargs = {
+        "MERGED_Q": merged_q,
+        "MERGED_Q_DK": merged_q_dk,
+        "NUM_DIAG_BLOCKS": max(1, dq_block_m // dq_block_n),
+        }
+
+    # print(kwargs, grid)
 
     _bwd_kernel[grid](
         q, k, v, ctx.sm_scale,
@@ -733,7 +792,7 @@ def _backward(ctx,
         BLOCK_N2=dk_block_n,
         BLOCK_DMODEL=ctx.block_d,
         NUM_DBLOCKS=q.shape[-1] // ctx.block_d,
-        **ctx.kwargs
+        **kwargs
     )
 
     if False:

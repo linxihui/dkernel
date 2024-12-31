@@ -1,0 +1,6 @@
+./build/*
+*.csv
+*.png
+results.html
+__pycache__
+*egg-info/

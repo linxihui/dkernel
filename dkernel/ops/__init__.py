@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from typing import Tuple, Dict, Optional, Union
+from typing import Tuple, Dict, Optional, Union, Callable
 from dkernel.ops.sparse_attn_fwd import _forward
 from dkernel.ops.sparse_attn_bwd import _backward
 from dkernel.ops.sparse_attn_inference import padded_sparse_attn, varlen_sparse_attn
@@ -15,7 +15,7 @@ class _sparse_attention(torch.autograd.Function):
                 v: Tensor,
                 sm_scale: int,
                 layout_csr: Tuple[Tensor, Tensor, int, int],
-                layout_csc: Tuple[Tensor, Tensor, int, int],
+                bwd_layout: Callable,
                 seq_dim: Optional[int],
                 inf_kwargs: Dict,
                 kwargs: Dict) -> Tensor:
@@ -26,7 +26,7 @@ class _sparse_attention(torch.autograd.Function):
         '''
         # shape constraints
         ctx.layout_csr = layout_csr
-        ctx.layout_csc = layout_csc
+        ctx.bwd_layout = bwd_layout
         seq_dim = 1 if seq_dim is None else seq_dim
         max_seqlen = kwargs.get("max_seqlen", None)
 

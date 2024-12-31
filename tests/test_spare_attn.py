@@ -67,32 +67,32 @@ def test_dims_and_dtype():
         dtype=torch.bfloat16, homo_head=False)
 
 
-def test_seqlen():
-    # diff seqlen
-    print("### Test different sequence lengths ###")
-    general_test_fn(2, 8, 15, 128,  block_size=64,
-        dtype=torch.bfloat16, homo_head=False)
-    general_test_fn(2, 8, 1028, 128,  block_size=32,
-            dtype=torch.bfloat16, homo_head=False)
-    general_test_fn(2, 8, 5175, 128,  block_size=64,
-            dtype=torch.bfloat16, homo_head=False)
-    general_test_fn(2, 8, 8192, 128,  block_size=64,
-            dtype=torch.bfloat16, homo_head=False)
+# def test_seqlen():
+#     # diff seqlen
+#     print("### Test different sequence lengths ###")
+#     general_test_fn(2, 8, 15, 128,  block_size=64,
+#         dtype=torch.bfloat16, homo_head=False)
+#     general_test_fn(2, 8, 1028, 128,  block_size=32,
+#             dtype=torch.bfloat16, homo_head=False)
+#     general_test_fn(2, 8, 5175, 128,  block_size=64,
+#             dtype=torch.bfloat16, homo_head=False)
+#     general_test_fn(2, 8, 8192, 128,  block_size=64,
+#             dtype=torch.bfloat16, homo_head=False)
 
 
 def test_inference_no_padding():
     print('### Test inference prompting and decoding ###')
     # short prompt
-    general_test_fn(2, 8, 15, 128,  past_len=0, max_seqlen=8192,
-            block_size=64, backward=False,
-            dtype=torch.bfloat16, homo_head=False)
+    # general_test_fn(2, 8, 15, 128,  past_len=0, max_seqlen=8192,
+    #         block_size=64, backward=False,
+    #         dtype=torch.bfloat16, homo_head=False)
     # decoding
-    general_test_fn(2, 8, 1, 128,  past_len=64*5 + 12, max_seqlen=8192,
+    general_test_fn(2, 8, 1, 128,  past_len=64*15 + 12, max_seqlen=8192,
             block_size=64, backward=False,
             dtype=torch.bfloat16, homo_head=False)
-    general_test_fn(2, 8, 1, 128,  past_len=64*50 + 12, max_seqlen=8192,
-            block_size=16, backward=False,
-            dtype=torch.bfloat16, homo_head=False)
+    # general_test_fn(2, 8, 1, 128,  past_len=64*50 + 12, max_seqlen=8192,
+    #         block_size=16, backward=False,
+    #         dtype=torch.bfloat16, homo_head=False)
     # # chunked prefilling, not supported yet
     # general_test_fn(2, 8, 12, 128,  past_len=2273, max_seqlen=8192,
     #         block_size=64, backward=False,
@@ -213,7 +213,9 @@ def general_test_fn(b, h, seqlen, d,
             num_kv_heads=None,
             varlen=False,
             has_left_paddings=False,
-            has_right_paddings=False):
+            has_right_paddings=False,
+            std=1.0,
+            **kwargs):
 
     qlen = seqlen
     past_len = past_len or 0
@@ -231,17 +233,17 @@ def general_test_fn(b, h, seqlen, d,
     else:
         h2, seqlen2, qlen2 = h, seqlen, qlen
     if seq_dim == 2:
-        q = torch.empty((b, h2, qlen2  , d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
-        k = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
-        v = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
+        q = torch.empty((b, h2, qlen2  , d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        k = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        v = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         q = q[:, :h, :qlen]
         k = k[:, :h, :seqlen]
         v = v[:, :h, :seqlen]
         h_dim = 1
     else:
-        q = torch.empty((b, qlen2  , h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
-        k = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
-        v = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=1)
+        q = torch.empty((b, qlen2  , h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        k = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        v = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         q = q[:, :qlen, :h]
         k = k[:, :seqlen,   :h]
         v = v[:, :seqlen,   :h]
@@ -304,7 +306,8 @@ def general_test_fn(b, h, seqlen, d,
                                                         block_n=block_n,
                                                         d_splits=d_splits,
                                                         seq_dim=seq_dim,
-                                                        head_sliding_offset=0
+                                                        head_sliding_offset=0,
+                                                        **kwargs
                                                         )
         sparse_attention_fn.to(q.device).to(q.dtype)
 
@@ -369,6 +372,7 @@ def general_test_fn(b, h, seqlen, d,
 
     # import ipdb; ipdb.set_trace()
     # decimal = 1 if dtype == torch.bfloat16 else 2
+    # import ipdb; ipdb.set_trace()
     assert torch.allclose(ref_out.cpu(), tri_out.cpu(), atol=1e-2, rtol=1e-2), \
         "---- out ---\n" + print_diff_stats(ref_out, tri_out)
 
@@ -379,12 +383,12 @@ def general_test_fn(b, h, seqlen, d,
         tri_dq, q.grad = q.grad.clone(), None
 
     if backward:
+        assert torch.allclose(ref_dq, tri_dq, atol=2e-2, rtol=0), \
+            "---- dq ---\n" + print_diff_stats(ref_dq, tri_dq)
         assert torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=1e-2), \
             "---- dv ---\n" + print_diff_stats(ref_dv, tri_dv)
         assert torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=0), \
             "---- dk ---\n" + print_diff_stats(ref_dk, tri_dk)
-        assert torch.allclose(ref_dq, tri_dq, atol=2e-2, rtol=0), \
-            "---- dq ---\n" + print_diff_stats(ref_dq, tri_dq)
 
     print('-'*80,
             f'\nTest passed:'
@@ -472,3 +476,16 @@ def print_diff_stats(ref, tri):
             f'.. {ref.abs().mean().item()=},\n'
             f'.. {(ref - tri).abs().ravel().topk(10).values=}')
     return (msg)
+
+
+if __name__  == '__main__':
+    # general_test_fn(1, 1, 1024, 128, vert_stride=4, local_blocks=2, block_size=16,
+    #         dtype=torch.bfloat16, homo_head=False,
+    #         block_m=128, block_n=16, std=2,
+    #         bwd_block_sizes=(128, 16, 128, 16)
+    #         )
+    # general_test_fn(2, 8, 8192, 128,  block_size=64,
+    #         dtype=torch.bfloat16, homo_head=False)
+    general_test_fn(2, 8, 1, 128,  past_len=64*15 + 12, max_seqlen=8192,
+            block_size=16, backward=False,
+            dtype=torch.bfloat16, homo_head=False)

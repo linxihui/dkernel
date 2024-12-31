@@ -10,6 +10,7 @@ import numpy as np
 from collections import namedtuple
 from torch import Tensor
 from typing import Tuple, Optional
+from functools import lru_cache
 # from scipy import sparse
 
 
@@ -102,6 +103,7 @@ def ccol_row_to_dense(ccol: Tensor,
     return crow_col_to_dense(ccol, rows, dtype).permute(0, 2, 1).contiguous()
 
 
+@lru_cache(maxsize=8)
 def get_sparse_attn_mask(num_heads: int,
                          seqlen: int,
                          block_size: int=64,
@@ -119,12 +121,14 @@ def get_sparse_attn_mask(num_heads: int,
     """Create the crow sparse layout, thhe block mask and the dense mask.
 
     # TODO: with num_kv_heads, make the pattern size (num_kv_heads, m_blocks, n_blocks), instead of (num_heads, ..., )
+    :param vert_stride: 
     :param head_sliding_steps: default to 1 if num_heads >= vert_stride else int(vert_stride / num_heads).
-    :param head_sliding_offsets:
+    :param head_sliding_offset:
     :return: a tuple of 3:
         - tuple of crow_indices, col_indices representation of CSR format.
         - block dense mask
         - all token dense mask (be aware that it can be OOM if it is too big) if `return_dense==True`, otherwise, None
+    
     """
     device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
     past_len = past_len or 0
@@ -142,7 +146,7 @@ def get_sparse_attn_mask(num_heads: int,
         blocks = triton.cdiv(seqlen, block_size)
         q_pos = torch.arange(blocks)[None, :, None]
         k_pos = torch.arange(blocks)[None, None]
-        head_sliding_step = max(1, int(vert_stride / num_heads))  # if vert_stride <= num_heads, rotating the heads
+        head_sliding_step = max(1, vert_stride // num_heads)  # if vert_stride <= num_heads, rotating the heads
         # TODO: make it (num_kv_heads, ) instead of expand to (num_heads,)
         mask_vert_strided = [(torch.arange(blocks) + h * head_sliding_step + head_sliding_offset) % vert_stride == 0
                              if h < num_sparse_heads else torch.ones(blocks).bool()
@@ -192,22 +196,28 @@ def is_causal(sparse_pattern: Tensor) -> bool:
     return not sparse_pattern.any()
 
 
-def merge_split_fwd_kernel_blocks(block_size: int,
-                                  sparse_pattern: Tensor,
-                                  block_m: int,
-                                  block_n: int
-                                  ) -> Tuple[Tensor, Tensor]:
+@lru_cache(maxsize=8)
+def merge_split_kernel_blocks(block_size: int,
+                            sparse_pattern: Tensor,
+                            block_m: int,
+                            block_n: int,
+                            sparse_format="csr"
+                            ) -> Tuple[Tensor, Tensor]:
     """Merge q/m blocks and splits on q/m and/or k/n blocks
     :param block_size: the sparse block size
     :param sparse_pattern: shape=(num_heads, num_blocks, num_blocks).
          Here num_heads can be 1 if homogeneous head pattern used.
     :param block_m: kernel block_size on q tokens
     :param block_n: kernel block_size on k tokens
+    :param sparse_format: csr or csc
 
     :return: new sparse layout
     """
+    assert sparse_format in ("csr", "csc")
+    dense_to_sparse_fn = dense_to_crow_col if sparse_format == "csr" else dense_to_ccol_row
+
     if block_size == block_m and block_size == block_n:
-        return dense_to_crow_col(sparse_pattern)
+        return dense_to_sparse_fn(sparse_pattern)
 
     # assert not getattr(self, "merged_or_splitted", False), "Already merged or splited"
     assert (block_m % block_size == 0) or (block_size % block_n == 0), \
@@ -232,15 +242,16 @@ def merge_split_fwd_kernel_blocks(block_size: int,
     if block_size < block_m:
         # merge
         H, M, N = sparse_pattern.shape
+        print(f"> {M=}, {N=}, {block_size=}, {sparse_pattern.size()=}")
         m_mult =  (block_m // block_size)
         assert M % m_mult == 0, f"> {M=}, {m_mult=}"
 
         # get the last nonzero index + 1,
         sparse_pattern = (sparse_pattern.to(torch.int32).view(H, M // m_mult, m_mult, N).flip([2]).cumsum(2) > 0).sum(2)
         sparse_pattern *= block_size
-        return dense_to_crow_col(sparse_pattern, include_values=True)
+        return dense_to_sparse_fn(sparse_pattern, include_values=True)
 
-    return dense_to_crow_col(sparse_pattern)
+    return dense_to_sparse_fn(sparse_pattern)
 
 
 def zero_stride(x: Tensor, dim=0) -> Tensor:

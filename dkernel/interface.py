@@ -11,11 +11,12 @@ from dkernel.utils import (get_sparse_attn_mask,
                           multiple_of,
                           is_kv_cache_efficient,
                           verify_sparse_pattern,
-                          merge_split_fwd_kernel_blocks,
+                          merge_split_kernel_blocks,
                           zero_stride)
 from dkernel.ops import _sparse_attention
 
 
+# @lru_cache(maxsize=8)
 class SparseAttention(torch.nn.Module):
     """
     Arguments
@@ -28,6 +29,7 @@ class SparseAttention(torch.nn.Module):
         Reduce them if you experience hardware resource constraint (shared memory).
         In that case, try first reduce `block_n`. If it is not enough, `block_m`.
         Latency-wise, reducing `block_n` likely has no impact, will reducing `block_m` may have a bigger impact.
+    bwd_block_sizes: Tuple of 4 integers, (block_n1, block_n1, block_m2, block_n2).
     kwargs: kernel args, do not use unless you know what you're doing.
             "out": to specify an output tensor,
             "d_splits": None/1/2. Number of splits on the HEAD_DIM, Default to 2 if head_dim >=128.
@@ -63,6 +65,7 @@ class SparseAttention(torch.nn.Module):
                  seq_dim: Optional[int]=None,
                  block_m: Optional[int]=None,
                  block_n: Optional[int]=None,
+                 bwd_block_sizes: Optional[Tuple[int]]=None,
                  **kwargs):
         super().__init__()
 
@@ -71,28 +74,25 @@ class SparseAttention(torch.nn.Module):
                 assert block_size >=16 and math.log2(block_size) % 1 == 0, \
                     f"{name} must be power of 2 and at least 16, but {block_size} is given."
 
+        # TODO: check block size based on is_kv_cache_efficient
         _check_block_size(block_size, "block_size")
         _check_block_size(block_m, "block_m")
         _check_block_size(block_n, "block_n")
         assert block_size >=16 and math.log2(block_size) % 1 == 0, \
             f"block_size must be power of 2 and at least 16, but {block_size} is given."
 
-
-        if block_n is None:
-            # should be SRAM dependent, capped at 64 is for most GPUs
-            block_n = min(block_size, 64)
-        if block_m is None:
-            block_m = min((128 * 64) // block_n, 128)
-
         sparse_pattern = sparse_pattern.to(torch.uint8)
         if sparse_pattern.dim() == 2:
             sparse_pattern = zero_stride(sparse_pattern[None])
 
         verify_sparse_pattern(sparse_pattern)
-        if not is_kv_cache_efficient(sparse_pattern, block_size, block_size):
+        self.is_kv_cache_efficient = is_kv_cache_efficient(sparse_pattern, block_size, block_size)
+
+        if not is_kv_cache_efficient:
             warnings.warn("The provided sparse_pattern is not efficient for KV cache, "
                           "i.e., KV cache needed for later tokens are not used in "
-                          "earlier tokens. This may result in unexpected larger KV cache.")
+                          "earlier tokens. This may result in unexpected larger KV cache."
+                          "In addition, Q blocks may not be merged to speed up.")
 
         self.block_size = block_size
         self.block_m = block_m
@@ -102,16 +102,12 @@ class SparseAttention(torch.nn.Module):
         self.kwargs = copy.copy(kwargs)
         self.kwargs["max_seqlen"] = self.max_seqlen
 
-        # No needed
-        # self.register_buffer("sparse_pattern",
-        #                      sparse_pattern,
-        #                      persistent=False)
+        # No needed after create the backward.
+        # This tensor should usually be shared, to avoid duplication through layers
+        self.register_buffer("sparse_pattern",
+                             sparse_pattern,
+                             persistent=False)
 
-        layout_csr = list(merge_split_fwd_kernel_blocks(
-                                    block_size,
-                                    sparse_pattern,
-                                    self.block_m,
-                                    self.block_n))
         # TODO: method to avoid this for inference?
         # TODO: need to split on backward for GPUs with less shared memory, but how to detech SRAM?
         # if self.block_size >= 128:
@@ -120,31 +116,112 @@ class SparseAttention(torch.nn.Module):
         #     self.block_m2 = 64
         # else:
         #     # for kv backward
-        self.block_n2 = min(self.block_size, 32) # min(self.block_size, 128) # 32
-        self.block_m2 =  min(128, 128 * 32 // self.block_n2)  # 128
 
+        # self.block_n2 = min(self.block_size, 32) # min(self.block_size, 128) # 32
+        # self.block_m2 =  min(128, 128 * 32 // self.block_n2)  # 128
 
-        if (self.block_m2 == self.block_size) and (self.block_n2 == self.block_size):
-            layout_csc = list(dense_to_ccol_row(sparse_pattern, include_values=False))
+        if self.is_kv_cache_efficient:
+            if block_n is None:
+                # should be SRAM dependent, capped at 64 is for most GPUs
+                block_n = min(block_size, 128)
+            if block_m is None:
+                block_m = min((128 * 128) // block_n, 128)
+            self.block_m, self.block_n = block_m, block_n
+            # largest m1 possible
+            block_n1 = min(self.block_size, 64)
+            block_m1 = min((128 * 64) // block_n1, 128)
+            # largest n2 possible
+            block_n2 =  min(self.block_size, 32) # min(self.block_size, 128)
+            block_m2 = min((128 * 32) // block_n2, 128)
         else:
-            _layout_csr = list(merge_split_fwd_kernel_blocks(
-                                        block_size,
-                                        sparse_pattern,
-                                        self.block_m2,
-                                        self.block_n2))
-            layout_csc = dense_to_ccol_row(crow_col_to_dense(*_layout_csr))
+            block_m1, block_n1, block_m2, block_m2 = [self.block_size] * 4
+            self.block_n = block_n or self.block_size
+            self.block_m = block_m or self.block_size
+            assert self.block_n == self.block_size and self.block_m == self.block_size, \
+                "Sparse pattern is not KV efficient. Title sizes must be the same as the sparse block size."
 
+        if bwd_block_sizes is not None:
+            assert len(bwd_block_sizes) == 4, "Tuple of 4, (block_m1, block_n1, block_m2, block_n2)."
+            if self.is_kv_cache_efficient:
+                assert all(x == self.block_size for x in bwd_block_sizes), \
+                    "Sparse pattern is not KV efficient. Title sizes must be the same as the sparse block size."
+            self.bwd_block_sizes = (tuple(bwd_block_sizes[:2]), tuple(bwd_block_sizes[2:]))
+        else:
+            self.bwd_block_sizes = ((block_m1, block_n1), (block_m2, block_n2))
+
+        # if (self.block_m2 == self.block_size) and (self.block_n2 == self.block_size):
+        #     layout_csc = list(dense_to_ccol_row(sparse_pattern, include_values=False))
+        # else:
+        #     _layout_csr = list(merge_split_kernel_blocks(
+        #                                 block_size,
+        #                                 sparse_pattern,
+        #                                 self.block_m2,
+        #                                 self.block_n2))
+        #     layout_csc = dense_to_ccol_row(crow_col_to_dense(*_layout_csr))
+
+        layout_csr = list(merge_split_kernel_blocks(
+                                    block_size,
+                                    sparse_pattern,
+                                    self.block_m,
+                                    self.block_n))
         if layout_csr[0].dim() == 1:
             layout_csr = [x[None] for x in layout_csr]
-            layout_csc = [x[None] for x in layout_csc]
+            # layout_csc = [x[None] for x in layout_csc]
         if layout_csr[0].size(0) == 1:
             layout_csr = [zero_stride(x) for x in layout_csr]
-            layout_csc = [zero_stride(x) for x in layout_csc]
+            # layout_csc = [zero_stride(x) for x in layout_csc]
 
-        self.register_buffer("layout_csr_crow", layout_csr[0].to(torch.int32), persistent=False)
-        self.register_buffer("layout_csr_col",  layout_csr[1].to(torch.int32), persistent=False)
-        self.register_buffer("layout_csc_ccol", layout_csc[0].to(torch.int32), persistent=False)
-        self.register_buffer("layout_csc_row",  layout_csc[1].to(torch.int32), persistent=False)
+        self.register_buffer("layout_csr_crow", layout_csr[0], persistent=False)
+        self.register_buffer("layout_csr_col",  layout_csr[1], persistent=False)
+        # self.register_buffer("layout_csc_ccol", layout_csc[0].to(torch.int32), persistent=False)
+        # self.register_buffer("layout_csc_row",  layout_csc[1].to(torch.int32), persistent=False)
+
+        # def _add_bwd_layout_tensor(module, grad_output):
+        #     if not hasattr(module, "bwd_layout_csr_crow"):
+        #         module._create_bwd_buffers()
+        # self.register_full_backward_pre_hook(_add_bwd_layout_tensor)
+
+    def _create_bwd_buffers(self):
+        print(f'..creating bwd layouts: {self.bwd_block_sizes}, {self.block_m=}, {self.block_n=}')
+        ((block_m1, block_n1), (block_m2, block_n2)) = self.bwd_block_sizes
+        bwd_layout_for_dq = merge_split_kernel_blocks(
+                                    self.block_size,
+                                    self.sparse_pattern,
+                                    block_m1,
+                                    block_n1)
+
+        bwd_layout_for_dkdv = merge_split_kernel_blocks(
+                                self.block_size,
+                                self.sparse_pattern,
+                                block_m2,
+                                block_n2,
+                                sparse_format="csc")
+
+        if bwd_layout_for_dq[0].dim() == 1:
+            bwd_layout_for_dq = [x[None] for x in bwd_layout_for_dq]
+            bwd_layout_for_dkdv = [x[None] for x in bwd_layout_for_dkdv]
+        if bwd_layout_for_dq[0].size(0) == 1:
+            bwd_layout_for_dq = [zero_stride(x) for x in bwd_layout_for_dq]
+            bwd_layout_for_dkdv = [zero_stride(x) for x in bwd_layout_for_dkdv]
+
+        # print(f'> {bwd_layout_for_dq[1]=}')
+        # print(f'> {bwd_layout_for_dkdv[1]=}')
+        # print(f'> {bwd_layout_for_dkdv[0]=}')
+        print(f'>> sparsity dkdq wrt full matrix(bidirection): {bwd_layout_for_dkdv[1].shape[1] / ((self.max_seqlen // block_m2) * (self.max_seqlen // block_n2))}')
+        self.register_buffer("bwd_layout_csr_crow", bwd_layout_for_dq[0], persistent=False)
+        self.register_buffer("bwd_layout_csr_col", bwd_layout_for_dq[1], persistent=False)
+        self.register_buffer("bwd_layout_csc_ccol", bwd_layout_for_dkdv[0], persistent=False)
+        self.register_buffer("bwd_layout_csc_row", bwd_layout_for_dkdv[1], persistent=False)
+
+    def _get_bwd_layout(self):
+        if not hasattr(self, "bwd_layout_csr_crow"):
+             self._create_bwd_buffers()
+
+        ((block_m1, block_n1), (block_m2, block_n2)) = self.bwd_block_sizes
+        return (
+            (self.bwd_layout_csr_crow, self.bwd_layout_csr_col, block_m1, block_n1),
+            (self.bwd_layout_csc_ccol, self.bwd_layout_csc_row, block_m2, block_n2),
+        )
 
     def forward(self,
                 q: Tensor,
@@ -204,7 +281,7 @@ class SparseAttention(torch.nn.Module):
         return _sparse_attention.apply(q, k, v,
                     sm_scale,
                     (self.layout_csr_crow, self.layout_csr_col, self.block_m,  self.block_n),
-                    (self.layout_csc_ccol, self.layout_csc_row, self.block_m2, self.block_n2),
+                    self._get_bwd_layout,
                     self.seq_dim,
                     inf_kwargs,
                     self.kwargs
