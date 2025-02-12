@@ -643,7 +643,7 @@ def _backward(ctx,
 
     if not o.is_contiguous():
         # TODO: currently only work with contiguous q/k/v.
-        raise ValueError(f'--> output is not contiguous: {o.stride()=}. This is maybe caused by q/k/v not being contiguous.')
+        raise ValueError(f'output is not contiguous: {o.stride()=}. This is maybe caused by q/k/v not being contiguous.')
 
     if layout_ccol_indices.dim() == 1:
         layout_ccol_indices = layout_ccol_indices[None].expand(q.shape[hdim], -1)
@@ -672,7 +672,12 @@ def _backward(ctx,
     hdim, seq_dim = ctx.hdim, ctx.seq_dim
     qlen = q.size(seq_dim)
 
-    assert o.stride() == dq.stride() == dk.stride() == dv.stride() == do.stride() # == do_scaled.stride()
+
+    def get_non_trival_stride(x):
+        return tuple(s if d > 1 else None for s, d in zip(x.stride(), x.size()))
+
+    assert len(set(get_non_trival_stride(x) for x in [o, dq, dk, dv, do])) == 1, \
+            f"strides incompatible: strides of o, dq, dk, dv, do are {[x.stride() for x in [o, dq, dk, dv, do]]}."
 
     grid = (triton.cdiv(qlen, dq_block_m), q.shape[0] * q.shape[hdim])
     # print(f'>> {grid=}')
