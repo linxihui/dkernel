@@ -52,8 +52,15 @@ def test_inference_padding_varlen():
     # 3.1, varlen, decoding: not needed, bad KV cache design
     # 3.2, vllm blocktable
 
-
-def test_dims_and_dtype():
+@pytest.mark.parametrize(
+   "b, h, seqlen, d, block_size, dtype",
+   [(1, 1, 1024, 64, 64, torch.float16),
+    (2, 8, 1024, 64, 64, torch.float32),
+    (2, 8, 1024, 128, 64, torch.bfloat16),
+    (2, 8, 1024, 256, 32, torch.fbloat16),
+    ]
+)
+def test_dims_and_dtype(b, h, seqlen, d, block_size, dtype):
     # diff dim, float types (float16, bfloat16, float32)
     print("### Test different head dims(64, 128, 256)" + \
             ", float types (float16, bfloat16, float32) ###")
@@ -236,17 +243,18 @@ def general_test_fn(b, h, seqlen, d,
         q = torch.empty((b, h2, qlen2  , d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         k = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         v = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        h_kv = num_kv_heads or h
         q = q[:, :h, :qlen]
-        k = k[:, :h, :seqlen]
-        v = v[:, :h, :seqlen]
+        k = k[:, :h_kv, :seqlen]
+        v = v[:, :h_kv, :seqlen]
         h_dim = 1
     else:
         q = torch.empty((b, qlen2  , h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         k = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         v = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         q = q[:, :qlen, :h]
-        k = k[:, :seqlen,   :h]
-        v = v[:, :seqlen,   :h]
+        k = k[:, :seqlen,   :h_kv]
+        v = v[:, :seqlen,   :h_kv]
         h_dim = 2
 
     if sm_scale is None:
@@ -258,7 +266,7 @@ def general_test_fn(b, h, seqlen, d,
 
     dout = torch.randn_like(q).contiguous()
 
-    mask_csr, block_mask, mask_dense = get_sparse_attn_mask(k.size(h_dim), k.size(seq_dim),
+    mask_csr, block_mask, mask_dense = get_sparse_attn_mask(h, k.size(seq_dim),
                                                             block_size=block_size,
                                                             local_blocks=local_blocks,
                                                             vert_stride=vert_stride,
@@ -392,7 +400,7 @@ def general_test_fn(b, h, seqlen, d,
 
     print('-'*80,
             f'\nTest passed:'
-            f'\n  {b=}, {h=}, {seqlen=}, {d=}, {past_len=}, {dtype=}',
+            f'\n  {b=}, {h=}, {seqlen=}, {d=}, {num_kv_heads=}, {past_len=}, {dtype=}',
             f'\n  {homo_head=}, {block_size=}, {local_blocks=}, {vert_stride=}'
             f'\n  {block_m=}, {block_n=}, {num_dense_heads=}, {d_splits=}',
             f'\n  {seq_dim=}, {non_contiguous=}'
@@ -410,7 +418,17 @@ def torch_attention(q, k, v,
     :param q, k, v: shape=(batch, heads, seq, head_dim) if seq_dim=2 (default)
             or shape=(batch, seq, heads, head_dim) if seq_dim=1.
     """
-    # for verification
+    if q.size(1) != k.size(1):
+        assert q.size(1) % k.size(1) == 0
+        q_per_k = q.size(1) // k.size(1)
+        k = k.repeat_interleave(q_per_k, dim=1)
+        v = v.repeat_interleave(q_per_k, dim=1)
+
+        if attn_mask.size(1) != q.size(1):
+            attn_mask = attn_mask.repeat_interleave(q_per_k, dim=0)
+
+    # if attn_mask.shape
+
     if sm_scale is None:
         sm_scale = 1 / math.sqrt(float(q.size(-1)))
 

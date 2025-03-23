@@ -30,15 +30,16 @@ except BaseException as e:
     HAS_FLEX_ATTN = False
 
 
-
 def run_bench(b=4,
               h=16,
               d=128,
+              num_kv_heads=None,
               local_tokens=512,
               vert=16,
               d_splits=None, block_size=64,
               block_m=None, block_n=None,
-              support_backward:bool=True,
+              block_h=1,
+              backward:bool=True,
               save_path='./benchmark/results/',
               log2_seqlen:int=16,
               num_dense_heads=0,
@@ -58,6 +59,7 @@ def run_bench(b=4,
     assert local_tokens % block_size == 0
     local = local_tokens // block_size
     BLOCK_SIZE, LOCAl_BLOCKS, VERT_STRIDE = block_size, local, vert
+    num_kv_heads = num_kv_heads or h
 
     # if run_test:
     #     for seqlen in [1024, 1028]:
@@ -67,14 +69,14 @@ def run_bench(b=4,
     #                 vert_stride=vert,
     #                 dtype=dtype,
     #                 homo_head=homo_head,
-    #                 backward=support_backward,
+    #                 backward=backward,
     #                 seq_dim=seq_dim,
     #                 block_m=block_m,
     #                 block_n=block_n)
 
     # os.environ["BS_DEBUG"] = "0"
 
-    modes = ['fwd', 'bwd'] if support_backward else ['fwd']
+    modes = ['fwd', 'bwd'] if backward else ['fwd']
 
     # if bwd_block_sizes is not None:
     #     print(f'>> {bwd_block_sizes=}')
@@ -107,8 +109,8 @@ def run_bench(b=4,
         sm_scale = 1.3
 
         q = torch.randn((BATCH, SEQ_LEN, H, D_HEAD), dtype=dtype, device='cuda', requires_grad=True)
-        k = torch.randn((BATCH, SEQ_LEN, H, D_HEAD), dtype=dtype, device='cuda', requires_grad=True)
-        v = torch.randn((BATCH, SEQ_LEN, H, D_HEAD), dtype=dtype, device='cuda', requires_grad=True)
+        k = torch.randn((BATCH, SEQ_LEN, num_kv_heads, D_HEAD), dtype=dtype, device='cuda', requires_grad=True)
+        v = torch.randn((BATCH, SEQ_LEN, num_kv_heads, D_HEAD), dtype=dtype, device='cuda', requires_grad=True)
 
         if provider == 'triton':
             # q = torch.randn((BATCH, H, SEQ_LEN, D_HEAD), dtype=dtype, device='cuda', requires_grad=True)
@@ -134,9 +136,11 @@ def run_bench(b=4,
                                                             LOCAl_BLOCKS,
                                                             VERT_STRIDE,
                                                             d_splits=d_splits,
+                                                            num_kv_heads=num_kv_heads,
                                                             num_dense_heads=num_dense_heads,
                                                             block_m=block_m,
                                                             block_n=block_n,
+                                                            block_h=block_h,
                                                             seq_dim=seq_dim,
                                                             bwd_block_sizes=bwd_block_sizes)
             sparse_attention_fn.to(q.device).to(q.dtype)

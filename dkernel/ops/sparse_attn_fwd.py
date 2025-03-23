@@ -1,9 +1,26 @@
+import warnings
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
 from typing import Tuple, Optional
 from dkernel.utils import multiple_of, is_hip
+
+
+@triton.jit
+def _load_multiple(ptrs, advance, num:tl.constexpr, mask=None):
+    x1 = tl.load(ptrs, mask=mask)
+    if num == 1:
+        return x1
+    ptrs += advance
+    x2 = tl.load(ptrs, mask=mask)
+    if num == 2:
+        return x1, x2
+    ptrs += advance
+    x3 = tl.load(ptrs, mask=mask)
+    if num == 3:
+        return x1, x2, x3
+
 
 
 @triton.jit
@@ -15,6 +32,7 @@ def _fwd_one_kv_block(
     stride_kn, stride_vn, stride_kd,
     PAST_LEN, N_CTX,
     dtype: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     LAST_N_BLOCK: tl.constexpr,
@@ -42,7 +60,8 @@ def _fwd_one_kv_block(
 
     if MERGED_Q:
         within_block_offset = PAST_LEN % BLOCK_M
-        qk += tl.where(tl.arange(0, BLOCK_M)[:, None] < micro_M - within_block_offset, 0, -1e6)
+        offs_m_loc = tl.arange(0, BLOCK_M * BLOCK_H) % BLOCK_M
+        qk += tl.where(offs_m_loc[:, None] < micro_M - within_block_offset, 0, -1e6)
     if CAUSAL & LAST_N_BLOCK:
         qk += tl.where(offs_m[:, None] + PAST_LEN >= (start_n + offs_n[None, :]), 0, -1e6)
 
@@ -84,7 +103,7 @@ fwd_configs = [
 @triton.autotune(
         fwd_configs,
         key=["N_CTX_FOR_AUTOTUNE", "BLOCK_DMODEL", "NUM_DBLOCKS",
-            "BLOCK_M", "BLOCK_N", "Q_ROUNDED_LEN"]
+            "BLOCK_H", "BLOCK_M", "BLOCK_N", "Q_ROUNDED_LEN"]
             )
 @triton.jit
 def _fwd_kernel(
@@ -100,15 +119,18 @@ def _fwd_kernel(
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
     Z, H, N_CTX,
+    Q_PER_K,
     PAST_LEN,
     Q_ROUNDED_LEN,
     N_CTX_FOR_AUTOTUNE,
+    BLOCK_H: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     EVEN_M_BLOCK: tl.constexpr,
     EVEN_N_BLOCK: tl.constexpr,
     INFERENCE: tl.constexpr,
+    HETERO_Q_GROUP: tl.constexpr,
     NUM_DBLOCKS: tl.constexpr,
     MERGED_Q: tl.constexpr,
     NUM_DIAG_BLOCKS: tl.constexpr,
@@ -116,31 +138,50 @@ def _fwd_kernel(
     Q_LEN = N_CTX - PAST_LEN
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
-    off_h = off_hz % H
-    off_z = off_hz // H
+    # off_h = off_hz % H
+    # off_z = off_hz // H
+    off_h = tl.program_id(1)
+    off_z = tl.program_id(2)
 
-    Q += off_z * stride_qz + off_h * stride_qh
-    K += off_z * stride_kz + off_h * stride_kh
-    V += off_z * stride_vz + off_h * stride_vh
+    # NUM_KV_HEADS = H // Q_PER_K
+    NUM_H_BLOCK_PER_GROUP = (Q_PER_K + BLOCK_H - 1) // BLOCK_H
+    off_h_for_kv = off_h // NUM_H_BLOCK_PER_GROUP
+    h_block_within_group = off_h % NUM_H_BLOCK_PER_GROUP
+
+    # LOAD_Q_PERK = 1, 2, 4, 8, ..
+    # Q_PER_K: any
+    off_h_for_q = off_h_for_kv * Q_PER_K + h_block_within_group * BLOCK_H
+    # off_h_for_kv = (off_h * BLOCK_H) // Q_PER_K
+
+    if HETERO_Q_GROUP:
+        off_h_for_layout = off_h_for_q
+    else:
+        off_h_for_layout = off_h_for_kv
+
+    Q += off_z * stride_qz # + off_h_for_q * stride_qh
+    K += off_z * stride_kz + off_h_for_kv * stride_kh
+    V += off_z * stride_vz + off_h_for_kv * stride_vh
     # initialize offsets
 
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # layout orderings: [H, M, N]
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M * BLOCK_H) % BLOCK_M
+    offs_hq = off_h_for_q + tl.arange(0, BLOCK_M * BLOCK_H) // BLOCK_M
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
-    off_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    # off_k = offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-    off_k = offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kd
-    off_v = offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+    offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd + offs_hq[:, None] * stride_qh
+    # offs_k = offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+    offs_k = offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kd
+    offs_v = offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
     # Initialize pointers to Q, K, V
-    q_ptrs  = Q + off_q
-    kt_ptrs = K + off_k
-    v_ptrs  = V + off_v
+    q_ptrs  = Q + offs_q
+    kt_ptrs = K + offs_k
+    v_ptrs  = V + offs_v
     # initialize pointer to m and l
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    m_i = tl.zeros([BLOCK_M*BLOCK_H], dtype=tl.float32) - float('inf')
+    l_i = tl.zeros([BLOCK_M*BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M*BLOCK_H, BLOCK_DMODEL], dtype=tl.float32)
     if NUM_DBLOCKS >= 2:
-        acc2 = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+        acc2 = tl.zeros([BLOCK_M*BLOCK_H, BLOCK_DMODEL], dtype=tl.float32)
     else:
         acc2 = 0
 
@@ -165,30 +206,42 @@ def _fwd_kernel(
     #                      mask=(q_offs_m >= 0) & (q_offs_m < Q_LEN))
 
     # load q: it will stay in SRAM throughout
-    q2 = 0
-    if EVEN_M_BLOCK:
+    # TODO:
+    # EVEN_H_BLOCK = (Q_PER_K % BLOCK_H == 0)
+    IS_NO_PADDING_H_BLOCK = (Q_PER_K % BLOCK_H == 0) | (off_h_for_q + BLOCK_H <= Q_PER_K)
+    # TODO: EVEN_M_BLOCK -> LAST_M_BLOCK.
+    # Problem: if NUM_M_BLOCKS is constexpr, compiler will need to recompile the kernel for each value.
+    #   => needs lots of kernels for inference. EVEN_M_BLOCK only has tow values, so it's fine.
+    # For H_blocks, it is different as H is typically fixed for a model
+    if EVEN_M_BLOCK & IS_NO_PADDING_H_BLOCK:
         q = tl.load(q_ptrs)
         if NUM_DBLOCKS >= 2:
             q2 = tl.load(q_ptrs + BLOCK_DMODEL * stride_qd)
+        else:
+            q2 = 0
     else:
-        q = tl.load(q_ptrs, mask=offs_m[:, None] < Q_LEN)
+        mask = (offs_m[:, None] < Q_LEN) & (offs_hq[:, None] < off_h_for_q + Q_PER_K)
+        q = tl.load(q_ptrs, mask=mask)
         if NUM_DBLOCKS >= 2:
-            q2 = tl.load(q_ptrs + BLOCK_DMODEL * stride_qd, mask=offs_m[:, None] < Q_LEN)
+            q2 = tl.load(q_ptrs + BLOCK_DMODEL * stride_qd, mask=mask)
+        else:
+            q2 = 0
 
-    layout_ptr = layout_crow_ptr + off_h * layout_crow_stride_h + start_m * layout_crow_stride_m
+    layout_ptr = layout_crow_ptr + off_h_for_layout * layout_crow_stride_h + start_m * layout_crow_stride_m
     start_l = tl.load(layout_ptr).to(tl.int32)
     end_l = tl.load(layout_ptr + layout_crow_stride_m).to(tl.int32)
     # start_l, end_l = tl.load(layout_ptr + tl.arange(0, 2) * layout_crow_stride_m).split()
 
+    layout_col_ptr += off_h_for_layout * layout_col_stride_h
     # loop over k, v and update accumulator
     non_diag_end = tl.maximum(end_l - NUM_DIAG_BLOCKS, start_l)
     for col_idx_idx in range(start_l, non_diag_end):
         # tl.device_print('# col_idx_idx:', col_idx_idx)
         if MERGED_Q:
-            bid_n = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m).to(tl.int32)
-            micro_M = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m + 1).to(tl.int32)
+            bid_n = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m).to(tl.int32)
+            micro_M = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m + 1).to(tl.int32)
         else:
-            bid_n = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m).to(tl.int32)
+            bid_n = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m).to(tl.int32)
             micro_M = 0
         acc, acc2, m_i, l_i = \
             _fwd_one_kv_block(bid_n, micro_M,
@@ -198,6 +251,7 @@ def _fwd_kernel(
                 stride_kn, stride_vn, stride_kd,
                 PAST_LEN, N_CTX,
                 dtype=Q.dtype.element_ty,
+                BLOCK_H=BLOCK_H,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 LAST_N_BLOCK=False,
@@ -211,10 +265,10 @@ def _fwd_kernel(
     for col_idx_idx in range(non_diag_end, end_l):
         # tl.device_print('> col_idx_idx:', col_idx_idx)
         if MERGED_Q:
-            bid_n = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m).to(tl.int32)
-            micro_M = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m + 1).to(tl.int32)
+            bid_n = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m).to(tl.int32)
+            micro_M = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m + 1).to(tl.int32)
         else:
-            bid_n = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m).to(tl.int32)
+            bid_n = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m).to(tl.int32)
             micro_M = 0
         acc, acc2, m_i, l_i = \
             _fwd_one_kv_block(bid_n, micro_M,
@@ -224,6 +278,7 @@ def _fwd_kernel(
                 stride_kn, stride_vn, stride_kd,
                 PAST_LEN, N_CTX,
                 dtype=Q.dtype.element_ty,
+                BLOCK_H=BLOCK_H,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 LAST_N_BLOCK=True,
@@ -242,16 +297,48 @@ def _fwd_kernel(
 
     # write back l and m
     if not INFERENCE:
-        l_ptrs = L + off_hz * Q_ROUNDED_LEN + offs_m
-        m_ptrs = M + off_hz * Q_ROUNDED_LEN + offs_m
-        tl.store(l_ptrs, l_i)
-        tl.store(m_ptrs, m_i)
-    off_o = off_z * stride_oz + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-    out_ptrs = Out + off_o
-    tl.store(out_ptrs, acc,  mask=offs_m[:, None] < Q_LEN)
-    if NUM_DBLOCKS >= 2:
-        tl.store(out_ptrs + BLOCK_DMODEL * stride_od, acc2,  mask=offs_m[:, None] < Q_LEN)
+        l_ptrs = L + off_z * H * Q_ROUNDED_LEN + offs_hq * Q_ROUNDED_LEN + offs_m
+        m_ptrs = M + off_z * H * Q_ROUNDED_LEN + offs_hq * Q_ROUNDED_LEN + offs_m
+        if IS_NO_PADDING_H_BLOCK:
+            tl.store(l_ptrs, l_i)
+            tl.store(m_ptrs, m_i)
+        else:
+            mask = offs_hq < off_h_for_q + Q_PER_K
+            tl.store(l_ptrs, l_i, mask=mask)
+            tl.store(m_ptrs, m_i, mask=mask)
 
+    off_o = off_z * stride_oz + offs_hq[:, None] * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+    out_ptrs = Out + off_o
+
+    if EVEN_M_BLOCK & IS_NO_PADDING_H_BLOCK:
+        tl.store(out_ptrs, acc)
+        if NUM_DBLOCKS >= 2:
+            tl.store(out_ptrs + BLOCK_DMODEL * stride_od, acc2)
+    else:
+        # mask = (offs_m[:, None] < Q_LEN) & (offs_hq[:, None] < H)
+        mask = (offs_m[:, None] < Q_LEN) & (offs_hq[:, None] < off_h_for_q + Q_PER_K)
+        tl.store(out_ptrs, acc,  mask=mask)
+        if NUM_DBLOCKS >= 2:
+            tl.store(out_ptrs + BLOCK_DMODEL * stride_od, acc2,  mask=mask)
+
+
+def get_block_h_and_m(q_per_k, qlen, klen, block_m):
+    if qlen == 1:
+        block_h = min(128, triton.next_power_of_2(q_per_k))
+        block_m = triton.cdiv(16, block_h)
+    else:
+        # == 1 is the most common case
+        # for short seq, block_h>=2 maynot be able to fully utilize all the SMs 
+        if q_per_k == 1 or qlen <= 1024:
+            block_h = 1
+        elif q_per_k % 4 == 0:
+            block_h = 4
+        elif q_per_k >= 8:
+            block_h = 2
+        else:
+            block_h = 1
+    return block_h, block_m
+    
 
 def _forward(ctx,
             q: Tensor,
@@ -264,6 +351,7 @@ def _forward(ctx,
             out:Optional[Tensor]=None,
             d_splits: Optional[int]=None,
             max_seqlen: Optional[int]=None,
+            block_h: Optional[int]=None,
             ) -> Tensor:
     """
     :param q, k, v: shape=(batch, n_heads, seq_len, head_size) if seq_len=2 else (batch, seq_len, n_heads, head_size).
@@ -277,7 +365,8 @@ def _forward(ctx,
     :param inference: if at inference mode, i.e., do not save addition info needed in the backward pass.
     :param out: if provided, output will be saved to.
     :param d_splits: None, 1 or 2.  None=1 if head_dim=64 else 2.
-    :param max_seqlen: used for checking input seqlen
+    :param max_seqlen: used for checking input seqlen.
+    :param block_h: number of q heads per block.
     """
     assert seq_dim in [2, 1]
     hdim = 3 - seq_dim
@@ -288,6 +377,13 @@ def _forward(ctx,
     layout_crow_indices, layout_col_indices, block_m, block_n = layout_csr
     qlen, klen = q.size(seq_dim), k.size(seq_dim)
     num_heads, num_kv_heads = q.size(hdim), k.size(hdim)
+    assert num_heads % num_kv_heads == 0
+    q_per_k = num_heads // num_kv_heads
+
+    
+    if block_h is None:
+        block_h, block_m = get_block_h_and_m(q_per_k, qlen, klen, block_m)
+    assert block_h <= triton.next_power_of_2(q_per_k), "block_h should be less than or equal to next power of 2 of q_per_k, otherwise, too many unneccessary paddings."
 
     if max_seqlen is not None:
         assert klen <= max_seqlen
@@ -328,18 +424,35 @@ def _forward(ctx,
         # Need to multiply layout_crow_indices, how to handle micro_M?
         block_m = max(triton.next_power_of_2(qlen), 16)
 
-    grid = (triton.cdiv(q.shape[seq_dim], block_m), q.shape[0] * q.shape[hdim])
+    # required by triton that all dimensions in matmul has to be power of 2
+    assert triton.next_power_of_2(block_h * block_m) ==  block_h * block_m
+
+    head_grid = k.shape[hdim] * triton.cdiv(q_per_k, block_h)
+    grid = (triton.cdiv(q.shape[seq_dim], block_m), head_grid, q.shape[0])
     q_rounded_len = grid[0] * block_m
 
     if inference:
-        L = m = q.new_empty((1,))
+        L = m = q.new_empty((1,)).contiguous()
     else:
-        L = torch.zeros((q.shape[0] * q.shape[hdim], q_rounded_len), device=q.device, dtype=torch.float32)
-        m = torch.zeros((q.shape[0] * q.shape[hdim], q_rounded_len), device=q.device, dtype=torch.float32)
+        L = torch.zeros((q.shape[0] * q.shape[hdim], q_rounded_len),
+                        device=q.device,
+                        dtype=torch.float32
+                        ).contiguous()
+        m = torch.zeros((q.shape[0] * q.shape[hdim], q_rounded_len),
+                        device=q.device,
+                        dtype=torch.float32
+                        ).contiguous()
 
     if layout_crow_indices.dim() == 1:
-        layout_crow_indices = layout_crow_indices[None].expand(q.shape[hdim] , -1)
-        layout_col_indices = layout_col_indices[None].expand((q.shape[hdim],) + layout_col_indices.shape)
+        layout_crow_indices = layout_crow_indices[None].expand(num_kv_heads , -1)
+        layout_col_indices = layout_col_indices[None].expand((num_kv_heads,) + layout_col_indices.shape)
+
+    HETERO_Q_GROUP = q_per_k > 1 and layout_crow_indices.size(0) == num_heads
+    if HETERO_Q_GROUP:
+        # heads within a q-group are heterogeneous, process one q head at a time instead
+        if block_h != 1:
+            warnings.warn("For within q-group heterogeneous heads, block_h must be 1. Setting block_h=1.")
+        block_h = 1
 
     if d_splits is None:
         block_d = max(64, q.shape[-1] // 2) # allow larger num_stages to split along D
@@ -348,7 +461,7 @@ def _forward(ctx,
         assert d_splits in [1, 2]
         block_d = q.shape[-1] // d_splits
 
-
+    # print(f'>> {grid=}, {block_h=}, {block_m=}')
     _fwd_kernel[grid](
         q, k, v, sm_scale,
         layout_crow_indices,
@@ -362,15 +475,18 @@ def _forward(ctx,
         v.stride(0), v.stride(hdim), v.stride(seq_dim), v.stride(3),
         o.stride(0), o.stride(hdim), o.stride(seq_dim), o.stride(3),
         q.shape[0], q.shape[hdim], k.shape[seq_dim],
+        q_per_k, # Q_PER_K
         k.shape[seq_dim] - q.shape[seq_dim], # PAST_LEN
         q_rounded_len,
         multiple_of(qlen, 1024), # N_CTX_FOR_AUTOTUNE, TODO: inference??
+        BLOCK_H=block_h,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_DMODEL=block_d,
         EVEN_M_BLOCK=qlen % block_m == 0,
         EVEN_N_BLOCK=klen % block_n == 0 ,
         INFERENCE=inference,
+        HETERO_Q_GROUP=HETERO_Q_GROUP,
         NUM_DBLOCKS=d_splits,
         **kwargs
     )
@@ -384,6 +500,7 @@ def _forward(ctx,
     ctx.merged_q = merged_q
     ctx.seq_dim = seq_dim
     ctx.hdim = hdim
+    ctx.q_per_k = q_per_k
     ctx.kwargs = kwargs
 
     return o

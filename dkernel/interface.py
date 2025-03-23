@@ -61,6 +61,8 @@ class SparseAttention(torch.nn.Module):
     def __init__(self,
                  block_size: int,
                  sparse_pattern: Tensor,
+                 num_heads: Optional[int]=None,
+                 num_kv_heads: Optional[int]=None,
                  *,
                  seq_dim: Optional[int]=None,
                  block_m: Optional[int]=None,
@@ -75,8 +77,10 @@ class SparseAttention(torch.nn.Module):
                     f"{name} must be power of 2 and at least 16, but {block_size} is given."
 
         # TODO: check block size based on is_kv_cache_efficient
-        _check_block_size(block_size, "block_size")
-        _check_block_size(block_m, "block_m")
+        if num_kv_heads is None or num_kv_heads == num_heads:
+            print(f'>> {num_kv_heads=}, {num_heads=}')
+            _check_block_size(block_size, "block_size")
+            _check_block_size(block_m, "block_m")
         _check_block_size(block_n, "block_n")
         assert block_size >=16 and math.log2(block_size) % 1 == 0, \
             f"block_size must be power of 2 and at least 16, but {block_size} is given."
@@ -120,6 +124,7 @@ class SparseAttention(torch.nn.Module):
         # self.block_n2 = min(self.block_size, 32) # min(self.block_size, 128) # 32
         # self.block_m2 =  min(128, 128 * 32 // self.block_n2)  # 128
 
+        # self.block_h = kwargs.get('block_h', 1)
         if self.is_kv_cache_efficient:
             if block_n is None:
                 # should be SRAM dependent, capped at 64 is for most GPUs
@@ -207,7 +212,7 @@ class SparseAttention(torch.nn.Module):
         # print(f'> {bwd_layout_for_dq[1]=}')
         # print(f'> {bwd_layout_for_dkdv[1]=}')
         # print(f'> {bwd_layout_for_dkdv[0]=}')
-        print(f'>> sparsity dkdq wrt full matrix(bidirection): {bwd_layout_for_dkdv[1].shape[1] / ((self.max_seqlen // block_m2) * (self.max_seqlen // block_n2))}')
+        # print(f'>> sparsity dkdq wrt full matrix(bidirection): {bwd_layout_for_dkdv[1].shape[1] / ((self.max_seqlen // block_m2) * (self.max_seqlen // block_n2))}')
         self.register_buffer("bwd_layout_csr_crow", bwd_layout_for_dq[0], persistent=False)
         self.register_buffer("bwd_layout_csr_col", bwd_layout_for_dq[1], persistent=False)
         self.register_buffer("bwd_layout_csc_ccol", bwd_layout_for_dkdv[0], persistent=False)
@@ -288,6 +293,9 @@ class SparseAttention(torch.nn.Module):
                     )
 
 
+# TODO:
+# - Add support for auto sequence length expansion
+
 @lru_cache(maxsize=8)
 class LocalStrideSparseAttention(SparseAttention):
     """
@@ -351,6 +359,7 @@ class LocalStrideSparseAttention(SparseAttention):
         self.vert_stride = vert_stride
         self.homo_head = homo_head
         self.num_dense_heads = num_dense_heads
+        # print(f'>>> {num_heads=}, {num_kv_heads=}')
         sparse_pattern = get_sparse_attn_mask(num_heads, self.max_seq_len,
                                               block_size=block_size,
                                               local_blocks=local_blocks,
@@ -368,7 +377,9 @@ class LocalStrideSparseAttention(SparseAttention):
             h_start, h_end = active_head_range
             sparse_pattern = sparse_pattern[h_start:h_end]
 
-        super().__init__(block_size, sparse_pattern, block_m=block_m, block_n=block_n, **kwargs)
+        super().__init__(block_size, sparse_pattern, block_m=block_m, block_n=block_n,
+                         num_heads=num_heads, num_kv_heads=num_kv_heads,
+                         **kwargs)
 
 
 __all__ = [

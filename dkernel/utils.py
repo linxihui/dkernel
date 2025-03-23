@@ -104,26 +104,29 @@ def ccol_row_to_dense(ccol: Tensor,
 
 
 @lru_cache(maxsize=8)
+@torch.no_grad()
 def get_sparse_attn_mask(num_heads: int,
                          seqlen: int,
                          block_size: int=64,
                          local_blocks: int=4,
                          vert_stride: int=4,
                          homo_head=False,
+                         homo_within_group_head=True,
                          num_kv_heads=None,
                          past_len=None,
                          dtype=torch.bfloat16,
                          device=None,
                          return_dense=False,
-                         head_sliding_steps=None,
+                         head_sliding_step=None,
                          head_sliding_offset=0,
                          num_dense_heads=0):
     """Create the crow sparse layout, thhe block mask and the dense mask.
 
     # TODO: with num_kv_heads, make the pattern size (num_kv_heads, m_blocks, n_blocks), instead of (num_heads, ..., )
     :param vert_stride: 
-    :param head_sliding_steps: default to 1 if num_heads >= vert_stride else int(vert_stride / num_heads).
+    :param head_sliding_step: default to 1 if num_heads >= vert_stride else int(vert_stride / num_heads).
     :param head_sliding_offset:
+    :param num_dense_heads: homo_within_group_head=True &homo_head=False, this is the kv_heads, otherwise, q_heads.
     :return: a tuple of 3:
         - tuple of crow_indices, col_indices representation of CSR format.
         - block dense mask
@@ -140,21 +143,23 @@ def get_sparse_attn_mask(num_heads: int,
 
     num_kv_heads = num_kv_heads or num_heads
     num_sparse_heads = num_kv_heads - num_dense_heads
+    assert num_heads % num_kv_heads == 0
     num_q_per_kv = num_heads // num_kv_heads
+    is_gqa = num_q_per_kv > 1
 
-    with torch.no_grad():
-        blocks = triton.cdiv(seqlen, block_size)
-        q_pos = torch.arange(blocks)[None, :, None]
-        k_pos = torch.arange(blocks)[None, None]
-        head_sliding_step = max(1, vert_stride // num_heads)  # if vert_stride <= num_heads, rotating the heads
-        # TODO: make it (num_kv_heads, ) instead of expand to (num_heads,)
-        mask_vert_strided = [(torch.arange(blocks) + h * head_sliding_step + head_sliding_offset) % vert_stride == 0
-                             if h < num_sparse_heads else torch.ones(blocks).bool()
-                             for h in range(num_kv_heads) for _ in range(num_q_per_kv) ]
-        mask_vert_strided = torch.vstack(mask_vert_strided).unsqueeze(1)
-        block_mask = ((q_pos >= k_pos) & ((q_pos - k_pos < local_blocks) | mask_vert_strided)).to(device).to(dtype)
-        q_start_block = triton.cdiv(past_len, block_size)
-        trimmed_block_mask = block_mask[:, q_start_block:]
+    blocks = triton.cdiv(seqlen, block_size)
+    q_pos = torch.arange(blocks)[None, :, None]
+    k_pos = torch.arange(blocks)[None, None]
+    num_patterns = num_kv_heads if is_gqa and homo_within_group_head else num_heads
+    if head_sliding_step is None:
+        head_sliding_step = max(1, vert_stride // num_patterns)  # if vert_stride <= num_heads, rotating the heads
+    mask_vert_strided = [(torch.arange(blocks) + h * head_sliding_step + head_sliding_offset) % vert_stride == 0
+                            if h < num_sparse_heads else torch.ones(blocks).bool()
+                            for h in range(num_patterns)]
+    mask_vert_strided = torch.vstack(mask_vert_strided).unsqueeze(1)
+    block_mask = ((q_pos >= k_pos) & ((q_pos - k_pos < local_blocks) | mask_vert_strided)).to(device).to(dtype)
+    q_start_block = triton.cdiv(past_len, block_size)
+    trimmed_block_mask = block_mask[:, q_start_block:]
 
     if return_dense:
         mask_dense = torch.kron(block_mask, block_mask.new_ones((block_size, block_size)))[..., :seqlen, :seqlen]
@@ -242,7 +247,7 @@ def merge_split_kernel_blocks(block_size: int,
     if block_size < block_m:
         # merge
         H, M, N = sparse_pattern.shape
-        print(f"> {M=}, {N=}, {block_size=}, {sparse_pattern.size()=}")
+        # print(f"> {M=}, {N=}, {block_size=}, {sparse_pattern.size()=}")
         m_mult =  (block_m // block_size)
         assert M % m_mult == 0, f"> {M=}, {m_mult=}"
 
@@ -279,3 +284,9 @@ def get_q_block_ids(past_len, q_len, block_size):
     start = past_len // block_size
     end = triton.cdiv(past_len + q_len, block_size)
     return range(start, end)
+
+
+# TODO: implement this
+def get_dense_mask(sparse_attn):
+    """Get dense mask from modified csr format"""
+    pass

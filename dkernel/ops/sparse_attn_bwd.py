@@ -18,6 +18,14 @@ from dkernel.utils import multiple_of, is_hip
 """
 
 
+@triton.jit
+def store_or_atomic_add(ptrs, values, mask=None, atomic=False):
+    if atomic:
+        tl.atomic_add(ptrs, values, mask=mask)
+    else:
+        tl.store(ptrs, values, mask=mask)
+
+
 ## backward
 @triton.heuristics(
     {
@@ -145,7 +153,7 @@ def _bwd_inner_dkdv(
 
 @triton.jit
 def _bwd_kernel_dkdv(
-    start_n, off_hz,
+    start_n, off_h, off_z,
     Q, K, V, sm_scale,
     layout_ccol_ptr,
     layout_row_ptr,
@@ -160,28 +168,40 @@ def _bwd_kernel_dkdv(
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
     # stride_dz, stride_dh, stride_dm, stride_dd,
-    Z, H, N_CTX, ROUNDED_CTX,
+    Z, H, N_CTX, 
+    Q_PER_K,
+    ROUNDED_CTX,
     num_block,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     EVEN_M_BLOCK: tl.constexpr,
     EVEN_N_BLOCK: tl.constexpr,
     NUM_DBLOCKS: tl.constexpr,
     MERGED_Q: tl.constexpr,
+    HETERO_Q_GROUP: tl.constexpr,
 ):
     # start_n = tl.program_id(0)
     # off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
+    # off_z = off_hz // H
+    # off_h = off_hz % H
     # offset pointers for batch/head
-    Q += off_z * stride_qz + off_h * stride_qh
-    K += off_z * stride_kz + off_h * stride_kh
-    V += off_z * stride_vz + off_h * stride_vh
-    DO += off_z * stride_oz + off_h * stride_oh
+
+    NUM_H_BLOCK_PER_GROUP = (Q_PER_K + BLOCK_H - 1) // BLOCK_H
+    off_h_for_kv = off_h // NUM_H_BLOCK_PER_GROUP
+    h_block_within_group = off_h % NUM_H_BLOCK_PER_GROUP
+    off_h_for_q = off_h_for_kv * Q_PER_K + h_block_within_group * BLOCK_H
+
+    # offs_hq = off_h_for_q + tl.arange(0, BLOCK_M * BLOCK_H) // BLOCK_M
+
+    Q += off_z * stride_qz + off_h_for_q * stride_qh
+    K += off_z * stride_kz + off_h_for_kv * stride_kh
+    V += off_z * stride_vz + off_h_for_kv * stride_vh
+    DO += off_z * stride_oz + off_h_for_q * stride_oh
     # DQ += off_z * stride_oz + off_h * stride_oh
-    DK += off_z * stride_oz + off_h * stride_oh
-    DV += off_z * stride_oz + off_h * stride_oh
+    DK += off_z * stride_oz + off_h_for_kv * stride_oh
+    DV += off_z * stride_oz + off_h_for_kv * stride_oh
     # Look like this loop can be parallelled
     # for start_n in range(0, num_block):
 
@@ -193,8 +213,8 @@ def _bwd_kernel_dkdv(
     v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
 
     # pointer to row-wise quantities in value-like data
-    D_ptrs = D + off_hz * ROUNDED_CTX
-    m_ptrs = M + off_hz * ROUNDED_CTX
+    D_ptrs = D + off_z * ROUNDED_CTX * H + off_h_for_q * ROUNDED_CTX
+    m_ptrs = M + off_z * ROUNDED_CTX * H + off_h_for_q * ROUNDED_CTX
     # initialize dv amd dk
     dv = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
     dk = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
@@ -218,81 +238,94 @@ def _bwd_kernel_dkdv(
     else:
         k2, v2, dk2, dv2 = 0, 0, 0, 0
 
-    # loop over rows
-
-    layout_ptr = layout_ccol_ptr + off_h * layout_ccol_stride_h + start_n * layout_ccol_stride_m
-    start_l = tl.load(layout_ptr).to(tl.int32)
-    end_l = tl.load(layout_ptr + layout_ccol_stride_m).to(tl.int32)
-    qk_scale = sm_scale * 1.44269504
-
-    ## for seqlen < max_seqlen, need to truncat up to seqlen
-    ## can use  max_m_blocks, as this is 'KV cache frendly"
-    ## potential problem: when BLOCK_N != BLOCK_M
-
-    start_m_of_n = (start_n * BLOCK_N) // BLOCK_M
-    max_m_blocks = (N_CTX - start_m_of_n * BLOCK_M + BLOCK_M - 1) // BLOCK_M
-    end_l = tl.minimum(end_l, start_l + max_m_blocks)
-
-    # sol2?
-    # end_l = tl.minimum(end_l, (N_CTX + BLOCK_M - 1) // BLOCK_M)
-
-    # if start_n == 8:
-    #     tl.device_print('start_l,end_l: ', start_l*1000 + end_l)
-    #     # tl.device_print('')
-
-    for row_idx_idx in range(start_l, end_l):
-        row_idx = tl.load(layout_row_ptr + off_h * layout_row_stride_h + row_idx_idx * layout_row_stride_m).to(tl.int32)
-
-        if MERGED_Q:
-            micro_M = tl.load(layout_row_ptr + off_h * layout_row_stride_h + row_idx_idx * layout_row_stride_m + 1).to(tl.int32)
+    for off_hq in range(off_h_for_q, tl.minimum(Q_PER_K * (off_h_for_kv + 1), off_h_for_q + BLOCK_H)):
+        if HETERO_Q_GROUP:
+            off_h_for_layout = off_hq
         else:
-            micro_M = BLOCK_M
+            off_h_for_layout = off_h_for_kv
+        layout_ptr = layout_ccol_ptr + off_h_for_layout * layout_ccol_stride_h + start_n * layout_ccol_stride_m
+        start_l = tl.load(layout_ptr).to(tl.int32)
+        end_l = tl.load(layout_ptr + layout_ccol_stride_m).to(tl.int32)
+        qk_scale = sm_scale * 1.44269504
+
+        ## for seqlen < max_seqlen, need to truncat up to seqlen
+        ## can use  max_m_blocks, as this is 'KV cache frendly"
+        ## potential problem: when BLOCK_N != BLOCK_M
+
+        start_m_of_n = (start_n * BLOCK_N) // BLOCK_M
+        max_m_blocks = (N_CTX - start_m_of_n * BLOCK_M + BLOCK_M - 1) // BLOCK_M
+        end_l = tl.minimum(end_l, start_l + max_m_blocks)
+
+        # sol2?
+        # end_l = tl.minimum(end_l, (N_CTX + BLOCK_M - 1) // BLOCK_M)
 
         # if start_n == 8:
-        #     tl.device_print('row_idx, micro_m:', row_idx_idx*100000 + row_idx * 1000 + micro_M)
+        #     tl.device_print('start_l,end_l: ', start_l*1000 + end_l)
+        #     # tl.device_print('')
 
-        # tl.device_print('Micro_M:', micro_M)
-        start_m = row_idx * BLOCK_M
+        for row_idx_idx in range(start_l, end_l):
+            row_idx = tl.load(layout_row_ptr + off_h * layout_row_stride_h + row_idx_idx * layout_row_stride_m).to(tl.int32)
 
-        # if start_m < N_CTX:
-        dk, dv, dk2, dv2 = _bwd_inner_dkdv(
-            micro_M,
-            dk, dv, dk2, dv2,
-            k, v, k2, v2,
-            Q, DO, m_ptrs, D_ptrs,
-            qk_scale, sm_scale,
-            start_m, offs_m, offs_n, offs_d,
-            stride_qm, stride_qd,
-            stride_om, stride_od,
-            N_CTX,
-            BLOCK_M,
-            BLOCK_N,
-            EVEN_M_BLOCK,
-            BLOCK_DMODEL,
-            NUM_DBLOCKS,
-            True,
-            MERGED_Q,
-        )
+            if MERGED_Q:
+                micro_M = tl.load(layout_row_ptr + off_h * layout_row_stride_h + row_idx_idx * layout_row_stride_m + 1).to(tl.int32)
+            else:
+                micro_M = BLOCK_M
+
+            # if start_n == 8:
+            #     tl.device_print('row_idx, micro_m:', row_idx_idx*100000 + row_idx * 1000 + micro_M)
+
+            # tl.device_print('Micro_M:', micro_M)
+            start_m = row_idx * BLOCK_M
+
+            # if start_m < N_CTX:
+            dk, dv, dk2, dv2 = _bwd_inner_dkdv(
+                micro_M,
+                dk, dv, dk2, dv2,
+                k, v, k2, v2,
+                Q, DO, m_ptrs, D_ptrs,
+                qk_scale, sm_scale,
+                start_m, offs_m, offs_n, offs_d,
+                stride_qm, stride_qd,
+                stride_om, stride_od,
+                N_CTX,
+                BLOCK_M,
+                BLOCK_N,
+                EVEN_M_BLOCK,
+                BLOCK_DMODEL,
+                NUM_DBLOCKS,
+                True,
+                MERGED_Q,
+            )
+            off_h_for_q += 1
+
+    Q += stride_qh
+    DO += stride_oh
+    D_ptrs += ROUNDED_CTX
+    m_ptrs += ROUNDED_CTX
+
+    # BLOCK_N < Q_PER_K, need to do atomic_add
 
     # write-back
     dv_ptrs = DV + (offs_n[:, None] * stride_om + offs_d[None, :] * stride_od)
     dk_ptrs = DK + (offs_n[:, None] * stride_om + offs_d[None, :] * stride_od)
+    use_atomic_add: tl.constexpr = BLOCK_H < Q_PER_K
     if EVEN_N_BLOCK:
-        tl.store(dv_ptrs, dv)
-        tl.store(dk_ptrs, dk)
+        store_or_atomic_add(dv_ptrs, dv, atomic=use_atomic_add)
+        store_or_atomic_add(dk_ptrs, dk, atomic=use_atomic_add)
     else:
-        tl.store(dv_ptrs, dv, mask=offs_n[:, None] < N_CTX)
-        tl.store(dk_ptrs, dk, mask=offs_n[:, None] < N_CTX)
+        store_or_atomic_add(dv_ptrs, dv, mask=offs_n[:, None] < N_CTX, atomic=use_atomic_add)
+        store_or_atomic_add(dk_ptrs, dk, mask=offs_n[:, None] < N_CTX, atomic=use_atomic_add)
 
     if NUM_DBLOCKS >= 2:
         dv_ptrs2 = dv_ptrs + BLOCK_DMODEL * stride_od
         dk_ptrs2 = dk_ptrs + BLOCK_DMODEL * stride_od
         if EVEN_N_BLOCK:
-            tl.store(dv_ptrs2, dv2)
-            tl.store(dk_ptrs2, dk2)
+            store_or_atomic_add(dv_ptrs2, dv2, atomic=use_atomic_add)
+            store_or_atomic_add(dk_ptrs2, dk2, atomic=use_atomic_add)
         else:
-            tl.store(dv_ptrs2, dv2, mask=offs_n[:, None] < N_CTX)
-            tl.store(dk_ptrs2, dk2, mask=offs_n[:, None] < N_CTX)
+            store_or_atomic_add(dv_ptrs2, dv2, mask=offs_n[:, None] < N_CTX, atomic=use_atomic_add)
+            store_or_atomic_add(dk_ptrs2, dk2, mask=offs_n[:, None] < N_CTX, atomic=use_atomic_add)
+
 
 @triton.jit
 def _bwd_inner_dq(
@@ -306,6 +339,7 @@ def _bwd_inner_dq(
     stride_vn, stride_vd,
     PAST_LEN, N_CTX,
     dtype: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     LAST_N_BLOCK: tl.constexpr,
@@ -342,7 +376,7 @@ def _bwd_inner_dq(
     p = tl.math.exp2(qk - m[:, None])
 
     # compute dp = dot(v, do)
-    dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
+    dp = tl.zeros([BLOCK_M * BLOCK_H, BLOCK_N], dtype=tl.float32) - Di[:, None]
     dp += tl.dot(do, vt)
 
     if NUM_DBLOCKS >= 2:
@@ -355,7 +389,9 @@ def _bwd_inner_dq(
     ds = p * dp * sm_scale
     if MERGED_Q:
         # ds += tl.where(tl.arange(0, BLOCK_M)[:, None] < micro_M, 0, float('-inf'))
-        ds *= (tl.arange(0, BLOCK_M)[:, None] < micro_M).to(ds.dtype)
+        # within_block_offset = PAST_LEN % BLOCK_M
+        offs_m_loc = tl.arange(0, BLOCK_M * BLOCK_H) % BLOCK_M
+        ds *= (offs_m_loc[:, None] < micro_M).to(ds.dtype)
 
     ds = ds.to(dtype)
     # # compute dq
@@ -368,7 +404,7 @@ def _bwd_inner_dq(
 
 @triton.jit
 def _bwd_kernel_dq(
-    start_m, off_hz,
+    start_m, off_h, off_z,
     Q, K, V, sm_scale,
     layout_crow_ptr,
     layout_col_ptr,
@@ -384,72 +420,97 @@ def _bwd_kernel_dq(
     stride_oz, stride_oh, stride_om, stride_od,
     # stride_dz, stride_dh, stride_dm, stride_dd,
     # TODO: strides for DO
-    Z, H, N_CTX, ROUNDED_CTX,
+    Z, H, N_CTX, 
+    Q_PER_K,
+    ROUNDED_CTX,
     num_block,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     EVEN_M_BLOCK: tl.constexpr,
     EVEN_N_BLOCK: tl.constexpr,
     NUM_DBLOCKS: tl.constexpr,
     MERGED_Q: tl.constexpr,
+    HETERO_Q_GROUP: tl.constexpr,
     NUM_DIAG_BLOCKS: tl.constexpr,
 ):
     # start_m = tl.program_id(0)
     # off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
+
+    # NUM_KV_HEADS = H // Q_PER_K
+    NUM_H_BLOCK_PER_GROUP = (Q_PER_K + BLOCK_H - 1) // BLOCK_H
+    off_h_for_kv = off_h // NUM_H_BLOCK_PER_GROUP
+    h_block_within_group = off_h % NUM_H_BLOCK_PER_GROUP
+
+    # LOAD_Q_PERK = 1, 2, 4, 8, ..
+    # Q_PER_K: any
+    off_h_for_q = off_h_for_kv * Q_PER_K + h_block_within_group * BLOCK_H
+    # off_h_for_kv = (off_h * BLOCK_H) // Q_PER_K
+
+    if HETERO_Q_GROUP:
+        off_h_for_layout = off_h_for_q
+    else:
+        off_h_for_layout = off_h_for_kv
+
     # offset pointers for batch/head
-    Q  += off_z * stride_qz + off_h * stride_qh
-    K  += off_z * stride_kz + off_h * stride_kh
-    V  += off_z * stride_vz + off_h * stride_vh
-    DO += off_z * stride_oz + off_h * stride_oh
-    DQ += off_z * stride_oz + off_h * stride_oh
+    Q  += off_z * stride_qz # + off_h_for_q * stride_qh
+    K  += off_z * stride_kz + off_h_for_kv * stride_kh
+    V  += off_z * stride_vz + off_h_for_kv * stride_vh
+    DO += off_z * stride_oz + off_h_for_q * stride_oh
+    DQ += off_z * stride_oz + off_h_for_q * stride_oh
     # DK += off_z * stride_oz + off_h * stride_oh
     # DV += off_z * stride_oz + off_h * stride_oh
     # Look like this loop can be parallelled
     # for start_n in range(0, num_block):
 
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M * BLOCK_H) % BLOCK_M
+    offs_hq = off_h_for_q + tl.arange(0, BLOCK_M * BLOCK_H) // BLOCK_M
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_q = offs_m[:, None] * stride_qm + offs_hq[:, None] * stride_qh + offs_d[None, :] * stride_qd
+    offs_o = offs_m[:, None] * stride_om + offs_hq[:, None] * stride_oh + offs_d[None, :] * stride_od
     # initialize pointers to value-like data
-    q_ptrs  = Q  + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
-    do_ptrs = DO + (offs_m[:, None] * stride_om + offs_d[None, :] * stride_od)
+    q_ptrs  = Q  + offs_q # (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+    do_ptrs = DO + offs_o # (offs_m[:, None] * stride_om + offs_d[None, :] * stride_od)
 
     # pointer to row-wise quantities in value-like data
-    d_ptrs = D + off_hz * ROUNDED_CTX + offs_m
-    m_ptrs = M + off_hz * ROUNDED_CTX + offs_m
+    offs_md = off_z * ROUNDED_CTX * H + offs_hq * ROUNDED_CTX + offs_m
+    d_ptrs = D + offs_md
+    m_ptrs = M + offs_md
 
     kt_ptrs =  K + (offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kd)
     vt_ptrs =  V + (offs_n[None, :] * stride_vn + offs_d[:, None] * stride_vd)
 
-    dq = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    dq = tl.zeros([BLOCK_M * BLOCK_H, BLOCK_DMODEL], dtype=tl.float32)
 
-    if EVEN_M_BLOCK:
+    IS_NO_PADDING_H_BLOCK = (Q_PER_K % BLOCK_H == 0) | (off_h_for_q + BLOCK_H <= Q_PER_K)
+
+    if EVEN_M_BLOCK & IS_NO_PADDING_H_BLOCK:
         q =  tl.load( q_ptrs)
         do = tl.load(do_ptrs)
         m =  tl.load( m_ptrs)
         Di = tl.load( d_ptrs)
     else:
-        q =  tl.load( q_ptrs, mask=offs_m[:, None] < N_CTX)
-        do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX)
-        m =  tl.load( m_ptrs, mask=offs_m < N_CTX)
-        Di = tl.load( d_ptrs, mask=offs_m < N_CTX)
+        mask = (offs_m < N_CTX) & (offs_hq < off_h_for_q + Q_PER_K)
+        q =  tl.load( q_ptrs, mask=mask[:, None])
+        do = tl.load(do_ptrs, mask=mask[:, None])
+        m =  tl.load( m_ptrs, mask=mask)
+        Di = tl.load( d_ptrs, mask=mask)
 
     if NUM_DBLOCKS >= 2:
-        dq2 = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
-        if EVEN_M_BLOCK:
+        dq2 = tl.zeros([BLOCK_M * BLOCK_H, BLOCK_DMODEL], dtype=tl.float32)
+        if EVEN_M_BLOCK & IS_NO_PADDING_H_BLOCK:
             q2 = tl.load(q_ptrs + BLOCK_DMODEL * stride_qd)
             do2 = tl.load(do_ptrs + BLOCK_DMODEL * stride_od)
         else:
-            q2 = tl.load(q_ptrs + BLOCK_DMODEL * stride_qd, mask=offs_m[:, None] < N_CTX)
-            do2 = tl.load(do_ptrs + BLOCK_DMODEL * stride_od, mask=offs_m[:, None] < N_CTX)
+            q2 = tl.load(q_ptrs + BLOCK_DMODEL * stride_qd, mask=mask[:, None])
+            do2 = tl.load(do_ptrs + BLOCK_DMODEL * stride_od, mask=mask[:, None])
     else:
         q2, dq2, do2 = 0, 0, 0
 
     # loop over rows
-    layout_ptr = layout_crow_ptr + off_h * layout_crow_stride_h + start_m * layout_crow_stride_m
+    layout_ptr = layout_crow_ptr + off_h_for_layout * layout_crow_stride_h + start_m * layout_crow_stride_m
     # se = tl.load(layout_ptr + tl.arange(0, 2) * layout_crow_stride_m)
     # start_l, end_l = tl.split(se)
     start_l = tl.load(layout_ptr).to(tl.int32)
@@ -458,13 +519,14 @@ def _bwd_kernel_dq(
 
     qk_scale = sm_scale * 1.44269504
 
+    layout_col_ptr += off_h_for_layout * layout_col_stride_h
     for col_idx_idx in range(start_l, non_diag_end):
         if MERGED_Q:
             # col_idx, micro_M = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m + tl.arange(0, 2)).split()
-            col_idx = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m).to(tl.int32)
-            micro_M = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m + 1).to(tl.int32)
+            col_idx = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m).to(tl.int32)
+            micro_M = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m + 1).to(tl.int32)
         else:
-            col_idx = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m).to(tl.int32)
+            col_idx = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m).to(tl.int32)
             micro_M = 0
         dq, dq2 = _bwd_inner_dq(
             col_idx, micro_M,
@@ -477,6 +539,7 @@ def _bwd_kernel_dq(
             stride_vn, stride_vd,
             0, N_CTX,
             dtype =Q.dtype.element_ty,
+            BLOCK_H=BLOCK_H,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             LAST_N_BLOCK=False,
@@ -489,11 +552,11 @@ def _bwd_kernel_dq(
     for col_idx_idx in range(non_diag_end, end_l):
         if MERGED_Q:
             # col_idx, micro_M = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m + tl.arange(0, 2)).split()
-            col_idx = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m).to(tl.int32)
-            micro_M = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m + 1).to(tl.int32)
+            col_idx = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m).to(tl.int32)
+            micro_M = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m + 1).to(tl.int32)
             # tl.device_print('col_idx: ', col_idx_idx*100 + col_idx)
         else:
-            col_idx = tl.load(layout_col_ptr +  off_h * layout_col_stride_h + col_idx_idx * layout_col_stride_m).to(tl.int32)
+            col_idx = tl.load(layout_col_ptr + col_idx_idx * layout_col_stride_m).to(tl.int32)
             micro_M = 0
         dq, dq2 = _bwd_inner_dq(
             col_idx, micro_M,
@@ -506,6 +569,7 @@ def _bwd_kernel_dq(
             stride_vn, stride_vd,
             0, N_CTX,
             dtype =Q.dtype.element_ty,
+            BLOCK_H=BLOCK_H,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             LAST_N_BLOCK=True,
@@ -516,19 +580,18 @@ def _bwd_kernel_dq(
             )
 
     # write-back
-    dq_ptrs = DQ + (offs_m[:, None] * stride_om + offs_d[None, :] * stride_od)
-    if EVEN_M_BLOCK:
+    dq_ptrs = DQ + offs_o
+    if EVEN_M_BLOCK & IS_NO_PADDING_H_BLOCK:
         tl.store(dq_ptrs, dq)
     else:
-        tl.store(dq_ptrs, dq, mask=offs_m[:, None] < N_CTX)
+        tl.store(dq_ptrs, dq, mask=mask[:, None])
 
     if NUM_DBLOCKS >= 2:
         dq_ptrs2 = dq_ptrs + BLOCK_DMODEL * stride_od
-        if EVEN_M_BLOCK:
+        if EVEN_M_BLOCK & IS_NO_PADDING_H_BLOCK:
             tl.store(dq_ptrs2, dq2)
         else:
-            tl.store(dq_ptrs2, dq2, mask=offs_m[:, None] < N_CTX)
-
+            tl.store(dq_ptrs2, dq2, mask=mask[:, None])
 
 
 # Does not suuport unequal seqlen(q) and seqlen(k)
@@ -581,6 +644,7 @@ def _bwd_kernel(
     # stride_dz, stride_dh, stride_dm, stride_dd,
     # TODO: strides for DO
     Z, H, N_CTX,
+    Q_PER_K,
     num_block,
     ROUNDED_CTX,
     NUM_M_BLOCK_FOR_DQ,
@@ -604,7 +668,7 @@ def _bwd_kernel(
 ):
     if (BLOCK_M == BLOCK_N2) | (tl.program_id(0) < NUM_M_BLOCK_FOR_DQ):
         _bwd_kernel_dq(
-            tl.program_id(0), tl.program_id(1),
+            tl.program_id(0), tl.program_id(1), tl.program_id(2),
             Q, K, V, sm_scale,
             layout_crow_ptr,
             layout_col_ptr,
@@ -632,7 +696,7 @@ def _bwd_kernel(
 
     if tl.program_id(0) >= NUM_M_BLOCK_FOR_DQ:
         _bwd_kernel_dkdv(
-            tl.program_id(0) - NUM_M_BLOCK_FOR_DQ, tl.program_id(1),
+            tl.program_id(0) - NUM_M_BLOCK_FOR_DQ, tl.program_id(1), tl.program_id(2),
             Q, K, V, sm_scale,
             layout_ccol_ptr,
             layout_row_ptr,
@@ -646,10 +710,13 @@ def _bwd_kernel(
             stride_kz, stride_kh, stride_kn, stride_kd,
             stride_vz, stride_vh, stride_vn, stride_vd,
             stride_oz, stride_oh, stride_om, stride_od,
-            Z, H, N_CTX, ROUNDED_CTX,
+            Z, H, N_CTX,
+            Q_PER_K,
+            ROUNDED_CTX,
             num_block,
             BLOCK_M2,
             BLOCK_N2,
+            BLOCK_H,
             BLOCK_DMODEL,
             EVEN_M2_BLOCK,
             EVEN_N2_BLOCK,
@@ -737,7 +804,10 @@ def _backward(ctx,
         num_m_block_for_dq = triton.cdiv(qlen, dq_block_m)
         num_seq_blocks = num_m_block_for_dq + triton.cdiv(qlen, dk_block_n)
 
-    grid = (num_seq_blocks, grid[1])
+    head_grid = k.shape[hdim] * triton.cdiv(ctx.q_per_k, ctx.block_h)
+    # grid = (triton.cdiv(q.shape[seq_dim], block_m), head_grid, q.shape[0])
+
+    grid = (num_seq_blocks, grid[1], grid[2])
     rounded_ctx = delta.size(-1)
 
     merged_q = False
