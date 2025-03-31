@@ -5,39 +5,126 @@ from torch import Tensor
 from typing import Tuple, Optional
 from dkernel.utils import multiple_of, is_hip
 
+# TODO: support different head_dim for k, v
+# Idea: support BLOCK_VD, BLOCK_VD2, when NUM_VD_BLOCKS == 2
+
+@triton.jit
+def _load_with_1d_mask(ptrs,
+                       left_d, right_d,
+                       EVEN_D: tl.constexpr,
+                       other=None,
+                       ):
+    if EVEN_D:
+        mask = None
+    else:
+        mask = (left_d < right_d)
+    return tl.load(ptrs, mask=mask, other=other)
+
+
+@triton.jit
+def _store_with_1d_mask(ptrs, values,
+                       left_d, right_d,
+                       EVEN_D: tl.constexpr,
+                       ):
+    if EVEN_D:
+        mask = None
+    else:
+        mask = (left_d < right_d)
+    tl.store(ptrs, values, mask=mask)
+
+
+@triton.jit
+def _load_with_2d_mask(ptrs,
+                       left_d1, right_d1,
+                       left_d2, right_d2,
+                       EVEN_D1: tl.constexpr,
+                       EVEN_D2: tl.constexpr,
+                       other=None,
+                       ):
+    need_mask_1: tl.constexpr = ~EVEN_D1
+    need_mask_2: tl.constexpr = ~EVEN_D2
+    if need_mask_1:
+        mask_1 = (left_d1 < right_d1)[:, None]
+    if need_mask_2:
+        mask_2 = (left_d2 < right_d2)[None, :]
+
+    if need_mask_1:
+        if need_mask_2:
+            result = tl.load(ptrs, mask=mask_1 & mask_2, other=other)
+        else:
+            result = tl.load(ptrs, mask=mask_1, other=other)
+    else:
+        if need_mask_2:
+            result = tl.load(ptrs, mask=mask_2, other=other)
+        else:
+            result = tl.load(ptrs, other=other)
+    return result
+
+
+@triton.jit
+def _store_with_2d_mask(ptrs, values,
+                       left_d1, right_d1,
+                       left_d2, right_d2,
+                       EVEN_D1: tl.constexpr,
+                       EVEN_D2: tl.constexpr,
+                       ):
+    need_mask_1: tl.constexpr = ~EVEN_D1
+    need_mask_2: tl.constexpr = ~EVEN_D2
+    if need_mask_1:
+        mask_1 = (left_d1 < right_d1)[:, None]
+    if need_mask_2:
+        mask_2 = (left_d2 < right_d2)[None, :]
+
+    if need_mask_1:
+        if need_mask_2:
+            tl.store(ptrs, values, mask=mask_1 & mask_2)
+        else:
+            tl.store(ptrs, values, mask=mask_1)
+    else:
+        if need_mask_2:
+            tl.store(ptrs, values, mask=mask_2)
+        else:
+            tl.store(ptrs, values)
+
 
 @triton.jit
 def _fwd_one_kv_block(
     bid_n, micro_M,
     q, q2, acc, acc2, m_i, l_i, sm_scale,
-    kt_ptrs, v_ptrs,
-    offs_m, offs_n,
+    kt_ptrs, kt_ptrs2, v_ptrs, v_ptrs2,
+    offs_m, offs_n, offs_d, offs_d2,
     stride_kn, stride_vn, stride_kd,
-    PAST_LEN, N_CTX,
+    PAST_LEN, N_CTX, D,
     dtype: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     LAST_N_BLOCK: tl.constexpr,
     CAUSAL: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
     NUM_DBLOCKS: tl.constexpr,
+    EVEN_D_BLOCK: tl.constexpr,
     MERGED_Q: tl.constexpr,
     ):
 
-    start_n = bid_n * BLOCK_N
-    if LAST_N_BLOCK:
-        kt = tl.load(kt_ptrs + start_n * stride_kn, mask=offs_n[None, :] + start_n < N_CTX)
-    else:
-        kt = tl.load(kt_ptrs + start_n * stride_kn)
 
+    EVEN_D1_BLOCK: tl.constexpr = EVEN_D_BLOCK | (NUM_DBLOCKS >= 2)
+    EVEN_D2_BLOCK: tl.constexpr = EVEN_D_BLOCK
+
+    start_n = bid_n * BLOCK_N
+    kt = _load_with_2d_mask(kt_ptrs + start_n * stride_kn,
+                            offs_d, D,
+                            offs_n, N_CTX - start_n,
+                            ~LAST_N_BLOCK,
+                            EVEN_D1_BLOCK)
     qk = tl.dot(q, kt) # TODO: (H, M, D), (D, N) -> (H, M, N)
 
     if NUM_DBLOCKS >= 2:
-        if LAST_N_BLOCK:
-            kt = tl.load(kt_ptrs + start_n * stride_kn + BLOCK_DMODEL * stride_kd, mask=offs_n[None, :] + start_n < N_CTX)
-        else:
-            kt = tl.load(kt_ptrs + start_n * stride_kn + BLOCK_DMODEL * stride_kd)
+        kt = _load_with_2d_mask(kt_ptrs2 + start_n * stride_kn,
+                                offs_d2, D,
+                                offs_n, N_CTX - start_n,
+                                ~LAST_N_BLOCK,
+                                EVEN_D2_BLOCK)
         qk += tl.dot(q2, kt)
+
     qk *= sm_scale
 
     if MERGED_Q:
@@ -57,18 +144,22 @@ def _fwd_one_kv_block(
     l_i = l_i * alpha + l_ij  # the normalizer of p above
 
     p = p.to(dtype)
-    if LAST_N_BLOCK:
-        v = tl.load(v_ptrs + start_n * stride_vn, mask=offs_n[:, None] + start_n < N_CTX)
-    else:
-        v = tl.load(v_ptrs + start_n * stride_vn)
+
+    # v_ptrs = v_ptrs + start_n * stride_vn
+    v = _load_with_2d_mask(v_ptrs + start_n * stride_vn,
+                           offs_n, N_CTX - start_n,
+                           offs_d, D,
+                           ~LAST_N_BLOCK,
+                           EVEN_D1_BLOCK)
     acc += tl.dot(p, v)
 
     if NUM_DBLOCKS >= 2:
         acc2 = acc2 * alpha[:, None]
-        if LAST_N_BLOCK:
-            v = tl.load(v_ptrs + start_n * stride_vn + BLOCK_DMODEL * stride_kd, mask=offs_n[:, None] + start_n < N_CTX)
-        else:
-            v = tl.load(v_ptrs + start_n * stride_vn + BLOCK_DMODEL * stride_kd)
+        v = _load_with_2d_mask(v_ptrs2 + start_n * stride_vn,
+                               offs_n, N_CTX - start_n,
+                               offs_d2, D,
+                               ~LAST_N_BLOCK,
+                               EVEN_D2_BLOCK)
         acc2 += tl.dot(p, v)
 
     return acc, acc2, m_i, l_i
@@ -83,11 +174,11 @@ fwd_configs = [
 
 @triton.autotune(
         fwd_configs,
-        key=["N_CTX_FOR_AUTOTUNE", "BLOCK_DMODEL", "NUM_DBLOCKS",
-            "BLOCK_M", "BLOCK_N", "Q_ROUNDED_LEN"]
+        key=["N_CTX_FOR_AUTOTUNE", "BLOCK_D", "BLOCK_D2",
+             "NUM_DBLOCKS", "BLOCK_M", "BLOCK_N", "Q_ROUNDED_LEN"]
             )
 @triton.jit
-def _fwd_kernel(
+def _sparse_fwd_kernel(
     Q, K, V, sm_scale,
     layout_crow_ptr,
     layout_col_ptr,
@@ -99,15 +190,17 @@ def _fwd_kernel(
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
-    Z, H, N_CTX,
+    Z, H, N_CTX, D,
     PAST_LEN,
     Q_ROUNDED_LEN,
     N_CTX_FOR_AUTOTUNE,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_D2: tl.constexpr,
     EVEN_M_BLOCK: tl.constexpr,
     EVEN_N_BLOCK: tl.constexpr,
+    EVEN_D_BLOCK: tl.constexpr,
     INFERENCE: tl.constexpr,
     NUM_DBLOCKS: tl.constexpr,
     MERGED_Q: tl.constexpr,
@@ -126,21 +219,23 @@ def _fwd_kernel(
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_DMODEL)
-    off_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    # off_k = offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-    off_k = offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kd
-    off_v = offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+    offs_d = tl.arange(0, BLOCK_D)
+
+    EVEN_D1_BLOCK: tl.constexpr = EVEN_D_BLOCK | (NUM_DBLOCKS >= 2)
+    EVEN_D2_BLOCK: tl.constexpr = EVEN_D_BLOCK
+
     # Initialize pointers to Q, K, V
-    q_ptrs  = Q + off_q
-    kt_ptrs = K + off_k
-    v_ptrs  = V + off_v
+    q_ptrs  = Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    kt_ptrs = K + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kd
+    v_ptrs  = V + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+
     if NUM_DBLOCKS >= 2:
-        acc2 = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+        acc2 = tl.zeros([BLOCK_M, BLOCK_D2], dtype=tl.float32)
     else:
         acc2 = 0
 
@@ -161,19 +256,34 @@ def _fwd_kernel(
     #     q_ptrs = Q + q_offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
     #     q = tl.load(q_ptrs, mask=(q_offs_m >= 0) & (q_offs_m < Q_LEN))
     #     if NUM_DBLOCKS >= 2:
-    #         q2 = tl.load(q_ptrs + BLOCK_DMODEL + stride_qd,
+    #         q2 = tl.load(q_ptrs + BLOCK_D + stride_qd,
     #                      mask=(q_offs_m >= 0) & (q_offs_m < Q_LEN))
 
     # load q: it will stay in SRAM throughout
-    q2 = 0
-    if EVEN_M_BLOCK:
-        q = tl.load(q_ptrs)
-        if NUM_DBLOCKS >= 2:
-            q2 = tl.load(q_ptrs + BLOCK_DMODEL * stride_qd)
+
+    q = _load_with_2d_mask(q_ptrs,
+                           offs_m, Q_LEN,
+                           offs_d, D,
+                           EVEN_M_BLOCK,
+                           EVEN_D1_BLOCK,
+                           other=0)
+
+    if NUM_DBLOCKS >= 2:
+        offs_d2 = BLOCK_D + tl.arange(0, BLOCK_D2)
+        q_ptrs2  = Q + offs_m[:, None] * stride_qm + offs_d2[None, :] * stride_qd
+        q2 = _load_with_2d_mask(q_ptrs2,
+                        offs_m, Q_LEN,
+                        offs_d2, D,
+                        EVEN_M_BLOCK,
+                        EVEN_D1_BLOCK,
+                        other=0)
+
+        kt_ptrs2 = K + offs_n[None, :] * stride_kn + offs_d2[:, None] * stride_kd
+        v_ptrs2  = V + offs_n[:, None] * stride_vn + offs_d2[None, :] * stride_vd
     else:
-        q = tl.load(q_ptrs, mask=offs_m[:, None] < Q_LEN)
-        if NUM_DBLOCKS >= 2:
-            q2 = tl.load(q_ptrs + BLOCK_DMODEL * stride_qd, mask=offs_m[:, None] < Q_LEN)
+        q2 = 0
+        kt_ptrs2, v_ptrs2 = None, None
+        offs_d2 = None
 
     layout_ptr = layout_crow_ptr + off_h * layout_crow_stride_h + start_m * layout_crow_stride_m
     start_l = tl.load(layout_ptr).to(tl.int32)
@@ -193,17 +303,17 @@ def _fwd_kernel(
         acc, acc2, m_i, l_i = \
             _fwd_one_kv_block(bid_n, micro_M,
                 q, q2, acc, acc2, m_i, l_i, sm_scale,
-                kt_ptrs, v_ptrs,
-                offs_m, offs_n,
+                kt_ptrs, kt_ptrs2, v_ptrs, v_ptrs2,
+                offs_m, offs_n, offs_d, offs_d2,
                 stride_kn, stride_vn, stride_kd,
-                PAST_LEN, N_CTX,
+                PAST_LEN, N_CTX, D,
                 dtype=Q.dtype.element_ty,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 LAST_N_BLOCK=False,
                 CAUSAL=True,
-                BLOCK_DMODEL=BLOCK_DMODEL,
                 NUM_DBLOCKS=NUM_DBLOCKS,
+                EVEN_D_BLOCK=EVEN_D_BLOCK,
                 MERGED_Q=MERGED_Q
                 )
 
@@ -219,17 +329,17 @@ def _fwd_kernel(
         acc, acc2, m_i, l_i = \
             _fwd_one_kv_block(bid_n, micro_M,
                 q, q2, acc, acc2, m_i, l_i, sm_scale,
-                kt_ptrs, v_ptrs,
-                offs_m, offs_n,
+                kt_ptrs, kt_ptrs2, v_ptrs, v_ptrs2,
+                offs_m, offs_n, offs_d, offs_d2,
                 stride_kn, stride_vn, stride_kd,
-                PAST_LEN, N_CTX,
+                PAST_LEN, N_CTX, D,
                 dtype=Q.dtype.element_ty,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 LAST_N_BLOCK=True,
                 CAUSAL=True,
-                BLOCK_DMODEL=BLOCK_DMODEL,
                 NUM_DBLOCKS=NUM_DBLOCKS,
+                EVEN_D_BLOCK=EVEN_D_BLOCK,
                 MERGED_Q=MERGED_Q
                 )
 
@@ -248,10 +358,22 @@ def _fwd_kernel(
         tl.store(m_ptrs, m_i)
     off_o = off_z * stride_oz + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
     out_ptrs = Out + off_o
-    tl.store(out_ptrs, acc,  mask=offs_m[:, None] < Q_LEN)
-    if NUM_DBLOCKS >= 2:
-        tl.store(out_ptrs + BLOCK_DMODEL * stride_od, acc2,  mask=offs_m[:, None] < Q_LEN)
 
+    _store_with_2d_mask(out_ptrs, acc,
+                        offs_m, Q_LEN,
+                        offs_d, D,
+                        EVEN_M_BLOCK,
+                        EVEN_D1_BLOCK,
+                        )
+    if NUM_DBLOCKS >= 2:
+        off_o = off_z * stride_oz + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d2[None, :] * stride_od
+        out_ptrs = Out + off_o
+        _store_with_2d_mask(out_ptrs, acc2,
+                            offs_m, Q_LEN,
+                            offs_d2, D,
+                            EVEN_M_BLOCK,
+                            EVEN_D2_BLOCK,
+                            )
 
 def _forward(ctx,
             q: Tensor,
@@ -268,7 +390,6 @@ def _forward(ctx,
     """
     :param q, k, v: shape=(batch, n_heads, seq_len, head_size) if seq_len=2 else (batch, seq_len, n_heads, head_size).
         Length of q is allowed to be different than k/v for decoding.
-        Note: head_size should be on of [64, 128, 256].
     :param sm_scale: softmax scale in attention.
     :param layout_csr: Tuple of (layout_crow_indices, layout_col_indices, int, int):
         same as CSR.crow_indices, and CSR.col_indices used to preresent a sparse tensor.
@@ -282,7 +403,7 @@ def _forward(ctx,
     assert seq_dim in [2, 1]
     hdim = 3 - seq_dim
     assert q.shape[-1] == k.shape[-1] == v.shape[-1]
-    assert q.shape[-1] in [64, 128, 256]
+    # assert q.shape[-1] in [64, 128, 256]
     assert k.shape[seq_dim] == v.shape[seq_dim]
 
     layout_crow_indices, layout_col_indices, block_m, block_n = layout_csr
@@ -341,15 +462,47 @@ def _forward(ctx,
         layout_crow_indices = layout_crow_indices[None].expand(q.shape[hdim] , -1)
         layout_col_indices = layout_col_indices[None].expand((q.shape[hdim],) + layout_col_indices.shape)
 
+    # support arbitrary head_dims
+    d = q.shape[-1]
+    d_p2 = triton.next_power_of_2(d)
     if d_splits is None:
-        block_d = max(64, q.shape[-1] // 2) # allow larger num_stages to split along D
-        d_splits = q.shape[-1] // block_d
+        # e.g., if d < 32, will be padded to next_power_of_2(d)
+        d_splits = 2 if d_p2 > 64 or (d > 32 and d_p2 != d) else 1
+
+    if d_splits == 1:
+        # d < 16, block_d = 16, block_d2 = 0, padding
+        # d = 16, block_d = 16, block_d2 = 0
+        # [17, 31), block_d = 32, block_d2 = 0, padding
+        # d = 32, block_d = 32, block_d2 = 0
+        # d = 64, block_d = 64, block_d2 = 0
+        block_d = max(triton.next_power_of_2(d), 16)
+        block_d2 = 0
+    elif d_splits == 2:
+        # e.g.,
+        # d = 48, block_d = 32, block_d2 = 16
+        # (48, 64) block_d = 32, blokc_d2 = 32, padding
+        # d = 96, block_d = 64, block_d2 = 32
+        # d = 128, block_d = 64, block_d2 = 64
+        # d = 160, block_d = 128, block_d2 = 32
+        # d = 190, block_d = 128, block_d2 = 64, padding
+        # d = 192, block_d = 128, block_d2 = 64
+        # d = 256, block_d = 128, block_d2 = 128
+        block_d = triton.next_power_of_2(triton.cdiv(d, 2))  # >= 32
+        block_d2 = max(triton.next_power_of_2(d - block_d), 16)
+    else:
+        ValueError(f"Invalid d_splits: {d_splits}. It must be either 1 or 2.")
+
+    even_d = (block_d + block_d2) == d
+
+    if d_splits is None:
+        block_d = max(64, triton.next_power_of_2(q.shape[-1] // 2)) # allow larger num_stages to split along D
+        d_splits = triton.cdiv(q.shape[-1],  block_d)
     else:
         assert d_splits in [1, 2]
-        block_d = q.shape[-1] // d_splits
+        block_d = triton.next_power_of_2(q.shape[-1] // d_splits)
 
 
-    _fwd_kernel[grid](
+    _sparse_fwd_kernel[grid](
         q, k, v, sm_scale,
         layout_crow_indices,
         layout_col_indices,
@@ -361,15 +514,17 @@ def _forward(ctx,
         k.stride(0), k.stride(hdim), k.stride(seq_dim), k.stride(3),
         v.stride(0), v.stride(hdim), v.stride(seq_dim), v.stride(3),
         o.stride(0), o.stride(hdim), o.stride(seq_dim), o.stride(3),
-        q.shape[0], q.shape[hdim], k.shape[seq_dim],
+        q.shape[0], q.shape[hdim], k.shape[seq_dim], q.shape[-1],
         k.shape[seq_dim] - q.shape[seq_dim], # PAST_LEN
         q_rounded_len,
         multiple_of(qlen, 1024), # N_CTX_FOR_AUTOTUNE, TODO: inference??
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        BLOCK_DMODEL=block_d,
+        BLOCK_D=block_d,
+        BLOCK_D2=block_d2,
         EVEN_M_BLOCK=qlen % block_m == 0,
         EVEN_N_BLOCK=klen % block_n == 0 ,
+        EVEN_D_BLOCK=even_d,
         INFERENCE=inference,
         NUM_DBLOCKS=d_splits,
         **kwargs
@@ -379,11 +534,13 @@ def _forward(ctx,
 
     ctx.save_for_backward(q, k, v, o, L, m)
     ctx.block_d = block_d
+    ctx.block_d2 = block_d2
     ctx.grid = grid
     ctx.sm_scale = sm_scale
     ctx.merged_q = merged_q
     ctx.seq_dim = seq_dim
     ctx.hdim = hdim
+    ctx.d_splits = d_splits
     ctx.kwargs = kwargs
 
     return o
