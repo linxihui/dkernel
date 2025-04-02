@@ -84,7 +84,7 @@ fwd_configs = [
 @triton.autotune(
         fwd_configs,
         key=["N_CTX_FOR_AUTOTUNE", "BLOCK_DMODEL", "NUM_DBLOCKS",
-            "BLOCK_M", "BLOCK_N", "Q_ROUNDED_LEN"]
+            "BLOCK_M", "BLOCK_N", "Q_ROUNDED_LEN", "CAUSAL"]
             )
 @triton.jit
 def _fwd_kernel(
@@ -100,7 +100,7 @@ def _fwd_kernel(
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
     Z, H, N_CTX,
-    PAST_LEN,
+    PAST_LEN, # q_start_pos, k_start_pos
     Q_ROUNDED_LEN,
     N_CTX_FOR_AUTOTUNE,
     BLOCK_M: tl.constexpr,
@@ -112,6 +112,7 @@ def _fwd_kernel(
     NUM_DBLOCKS: tl.constexpr,
     MERGED_Q: tl.constexpr,
     NUM_DIAG_BLOCKS: tl.constexpr,
+    CAUSAL: tl.constexpr,
 ):
     Q_LEN = N_CTX - PAST_LEN
     start_m = tl.program_id(0)
@@ -181,7 +182,11 @@ def _fwd_kernel(
     start_l, end_l = tl.load(layout_ptr + tl.arange(0, 2) * layout_crow_stride_m).split()
 
     # loop over k, v and update accumulator
-    non_diag_end = tl.maximum(end_l - NUM_DIAG_BLOCKS, start_l)
+    if CAUSAL:
+        non_diag_end = tl.maximum(end_l - NUM_DIAG_BLOCKS, start_l)
+    else:
+        non_diag_end = end_l
+
     for col_idx_idx in range(start_l, non_diag_end):
         # tl.device_print('# col_idx_idx:', col_idx_idx)
         if MERGED_Q:
@@ -201,7 +206,7 @@ def _fwd_kernel(
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 LAST_N_BLOCK=False,
-                CAUSAL=True,
+                CAUSAL=CAUSAL,
                 BLOCK_DMODEL=BLOCK_DMODEL,
                 NUM_DBLOCKS=NUM_DBLOCKS,
                 MERGED_Q=MERGED_Q
@@ -227,7 +232,7 @@ def _fwd_kernel(
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 LAST_N_BLOCK=True,
-                CAUSAL=True,
+                CAUSAL=CAUSAL,
                 BLOCK_DMODEL=BLOCK_DMODEL,
                 NUM_DBLOCKS=NUM_DBLOCKS,
                 MERGED_Q=MERGED_Q
@@ -264,6 +269,8 @@ def _forward(ctx,
             out:Optional[Tensor]=None,
             d_splits: Optional[int]=None,
             max_seqlen: Optional[int]=None,
+            return_lse: bool=False,
+            causal=True,
             ) -> Tensor:
     """
     :param q, k, v: shape=(batch, n_heads, seq_len, head_size) if seq_len=2 else (batch, seq_len, n_heads, head_size).
@@ -278,6 +285,10 @@ def _forward(ctx,
     :param out: if provided, output will be saved to.
     :param d_splits: None, 1 or 2.  None=1 if head_dim=64 else 2.
     :param max_seqlen: used for checking input seqlen
+
+    :Return:
+        output: Tensor with same shape as q
+        softmax_lse: logsumexp(logits), where logits are the softmax logits
     """
     assert seq_dim in [2, 1]
     hdim = 3 - seq_dim
@@ -348,7 +359,6 @@ def _forward(ctx,
         assert d_splits in [1, 2]
         block_d = q.shape[-1] // d_splits
 
-
     _fwd_kernel[grid](
         q, k, v, sm_scale,
         layout_crow_indices,
@@ -372,6 +382,7 @@ def _forward(ctx,
         EVEN_N_BLOCK=klen % block_n == 0 ,
         INFERENCE=inference,
         NUM_DBLOCKS=d_splits,
+        CAUSAL=causal,
         **kwargs
     )
     if inference:
@@ -384,9 +395,14 @@ def _forward(ctx,
     ctx.merged_q = merged_q
     ctx.seq_dim = seq_dim
     ctx.hdim = hdim
+    ctx.causal = causal
     ctx.kwargs = kwargs
 
-    return o
+    # m here is the log2sumexp ()
+    if return_lse:
+        softmax_lse = m.view(q.shape[0], num_heads, -1)[..., :qlen] * 0.69314718
+        return o, softmax_lse
+    return o, None
 
 
 __all__ = ["_forward"]

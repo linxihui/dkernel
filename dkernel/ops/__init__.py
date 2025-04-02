@@ -29,7 +29,9 @@ class _sparse_attention(torch.autograd.Function):
         ctx.layout_csc = layout_csc
         seq_dim = 1 if seq_dim is None else seq_dim
         max_seqlen = kwargs.get("max_seqlen", None)
+        # causal = kwargs.get('causal', True)
 
+        lse = None
         assert q.dim() in (3, 4)
         # need_backwards = q.requires_grad() or k.requires_grad() or v.requires_grad()
         if q.dim() == 3:
@@ -39,7 +41,8 @@ class _sparse_attention(torch.autograd.Function):
             ctx.message = "Currently does not suppoort variable length inputs. WIP."
             num_heads = q.size(1)
             num_kv_heads = k.size(1)
-            return varlen_sparse_attn(q, k, v,
+            # assert causal, "To be supported."
+            output = varlen_sparse_attn(q, k, v,
                                       inf_kwargs["cu_seqlen_k"],
                                       inf_kwargs.get("cu_seqlen_q", None),
                                       sm_scale,
@@ -53,7 +56,7 @@ class _sparse_attention(torch.autograd.Function):
             if has_paddings:
                 ctx.support_backward = False
                 ctx.message = "Currently does not support paddings in inputs. WIP."
-                return padded_sparse_attn(q, k, v,
+                output = padded_sparse_attn(q, k, v,
                                           sm_scale,
                                           layout_csr,
                                           left_paddings=left_paddings,
@@ -64,15 +67,22 @@ class _sparse_attention(torch.autograd.Function):
                 ctx.support_backward = True
                 ctx.message = ""
                 assert k.size(seq_dim) <= max_seqlen
-                return _forward(ctx, q, k, v, sm_scale, layout_csr, seq_dim=seq_dim, **kwargs)
+                output, lse = _forward(ctx, q, k, v, sm_scale, layout_csr, seq_dim=seq_dim, **kwargs)
+        return output, lse
 
     @staticmethod
-    def backward(ctx, do: Tensor) -> Tuple[Union[Tensor, None], ...]:
+    def backward(ctx, do: Tensor, dlse: Optional[Tensor]) -> Tuple[Union[Tensor, None], ...]:
+        """
+        Args:
+            do: output gradient
+            dlse: logsumexp gradient. It will be None if return_lse is False.
+        """
+
         assert ctx.support_backward, ctx.message
         q, k, v, o, l, m = ctx.saved_tensors
         assert q.size(ctx.seq_dim) == k.size(ctx.seq_dim), \
             "Backward supports only when q/k/v have the same sequence length."
-        return _backward(ctx, do)[:3] + (None, None, None, None, None, None)
+        return _backward(ctx, do, dlse)[:3] + (None, None, None, None, None, None)
 
 
 __all__ = ["_sparse_attention"]
