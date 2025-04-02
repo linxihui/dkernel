@@ -21,6 +21,7 @@ class SparseAttention(torch.nn.Module):
     =========
     block_size: sparse_block_size. It has to be power of 2 and minimum of 16.
     sparse_pattern: 2D or 3D (per head) boolean/uint8 Tensor(squared). 1=used, 0=skipped
+    causal: bool, default to True.
     seq_dim: Choices=[None, 1, 2]. Default to 1. Only applied to 4D inputs. Ignore if inputs have packed variable lengths.
     block_m, block_n:  The kernel block size for m blocks (q blocks) and n blocks (k/v blocks).
         Default to `block_size` and must be power of 2 with minimum of 16.
@@ -59,6 +60,7 @@ class SparseAttention(torch.nn.Module):
                  block_size: int,
                  sparse_pattern: Tensor,
                  *,
+                 causal: bool=True,
                  seq_dim: Optional[int]=None,
                  block_m: Optional[int]=None,
                  block_n: Optional[int]=None,
@@ -78,7 +80,7 @@ class SparseAttention(torch.nn.Module):
 
         if block_m is None:
             # TODO: 128?
-            block_m = max(block_size, 64)
+            block_m = max(block_size, 64) if causal else block_size
         if block_n is None:
             block_n = block_size
 
@@ -87,10 +89,10 @@ class SparseAttention(torch.nn.Module):
             sparse_pattern = zero_stride(sparse_pattern[None])
 
         verify_sparse_pattern(sparse_pattern)
-        if not is_kv_cache_efficient(sparse_pattern, block_size, block_size):
+        if causal and not is_kv_cache_efficient(sparse_pattern, block_size, block_size):
             warnings.warn("The provided sparse_pattern is not efficient for KV cache, "
-                          "i.e., KV cache needed for later tokens are not used in "
-                          "earlier tokens. This may result in unexpected larger KV cache.")
+                        "i.e., KV cache needed for later tokens are not used in "
+                        "earlier tokens. This may result in unexpected larger KV cache.")
 
         self.block_size = block_size
         self.block_m = block_m
@@ -99,11 +101,17 @@ class SparseAttention(torch.nn.Module):
         self.max_seqlen = sparse_pattern.size(1) * block_size
         self.kwargs = copy.copy(kwargs)
         self.kwargs["max_seqlen"] = self.max_seqlen
+        self.kwargs['causal'] = causal
 
         # No needed
         # self.register_buffer("sparse_pattern",
         #                      sparse_pattern,
         #                      persistent=False)
+
+        if not causal:
+            # Does not support merge-Q for non-causal
+            assert self.block_m <= block_size
+            assert self.block_n <= block_size
 
         layout_csr = list(merge_split_fwd_kernel_blocks(
                                     block_size,
@@ -146,6 +154,7 @@ class SparseAttention(torch.nn.Module):
                 cu_seqlen_q: Optional[Tensor]=None,
                 left_paddings: Optional[Tensor]=None,
                 seqlens: Optional[Tensor]=None,
+                return_lse: bool=False,
                 ) -> Tensor:
         """
         :param q, k, v:
@@ -167,6 +176,7 @@ class SparseAttention(torch.nn.Module):
         :param seqlens: real seqlen, can be optionally used when has right padding.
             No need to specify if left_paddings is used.
             Can only be used at inference.
+        :param return_lse: whether to return log softmax, mostly to combine kv partitions.
         """
 
         # check heads
@@ -189,14 +199,20 @@ class SparseAttention(torch.nn.Module):
                       "seqlens": seqlens
                       }
 
-        return _sparse_attention.apply(q, k, v,
+        kwargs = copy.copy(self.kwargs)
+        kwargs["return_lse"] = return_lse
+        output, lse = _sparse_attention.apply(q, k, v,
                     sm_scale,
                     (self.layout_csr_crow, self.layout_csr_col, self.block_m,  self.block_n),
                     (self.layout_csc_ccol, self.layout_csc_row, self.block_m2, self.block_n2),
                     self.seq_dim,
                     inf_kwargs,
-                    self.kwargs
+                    kwargs
                     )
+        if return_lse:
+            return output, lse
+        return output
+
 
 @lru_cache(maxsize=8)
 class LocalStrideSparseAttention(SparseAttention):
@@ -249,6 +265,7 @@ class LocalStrideSparseAttention(SparseAttention):
                  head_sliding_offset: int=0,
                  block_m: Optional[int]=None,
                  block_n: Optional[int]=None,
+                 causal: bool=True,
                  **kwargs
                  ):
         assert vert_stride >= 1, "Vertical stride should be position integer. Value 1 will collapse to dense attention."
@@ -269,7 +286,8 @@ class LocalStrideSparseAttention(SparseAttention):
                                               dtype=torch.uint8,
                                               num_kv_heads=num_kv_heads,
                                               head_sliding_offset=head_sliding_offset,
-                                              num_dense_heads=num_dense_heads)[1]
+                                              num_dense_heads=num_dense_heads,
+                                              causal=causal)[1]
 
         # no need to do this for homo heads, as patterns are the same across rangs
         if (not homo_head) and (active_head_range is not None):
@@ -278,10 +296,35 @@ class LocalStrideSparseAttention(SparseAttention):
             h_start, h_end = active_head_range
             sparse_pattern = sparse_pattern[h_start:h_end]
 
-        super().__init__(block_size, sparse_pattern, block_m=block_m, block_n=block_n, **kwargs)
+        super().__init__(block_size, sparse_pattern, block_m=block_m, block_n=block_n, causal=causal, **kwargs)
+
+
+def combine_attn_partitions(*x: Tuple[Tensor], hdim=1):
+    """For context parallelization, to combine multiple results from
+    multiple segments of k/v using output & softmax_lse (the weight logit).
+
+    This function is typically used in scenarios where outputs and their
+    corresponding weight logits (log-softmax values) from multiple partitions
+    need to be merged into a single result.
+    Args:
+        *x (Tuple[Tensor]): A variable number of tuples, where each tuple
+            contains two tensors: the output tensor and the weight logit tensor.
+        hdim (int, optional): The head dimension along which the weights are
+            expanded before applying them to the outputs. Defaults to 1.
+    Returns:
+        Tensor: The combined result obtained by weighting the outputs with
+            their corresponding softmax logits and summing across segments.
+    """
+    assert len(x) >= 2 and len(x[0]) == 2
+    outputs, weights = list(zip(*x))
+    weights = torch.stack(weights, dim=0).softmax(dim=0)
+    outputs = torch.stack(outputs, dim=0)
+    output = (outputs * weights.unsqueeze(-1)).sum(0).type_as(outputs)
+    return output
 
 
 __all__ = [
     "SparseAttention",
     "LocalStrideSparseAttention",
+    "combine_attn_partitions",
     ]

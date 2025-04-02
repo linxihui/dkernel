@@ -47,11 +47,13 @@ attn = LocalStrideSparseAttention(
 attn.to(device) # optional, attn default to current_device
 
 # For the first time, it needs to warmup, so could be slow.
-attn(q, k, v)
+attn(q, k, v, return_lse=True)
 
 # Now should be fast
-ouput = attn(q, k, v)
+ouput, lse = attn(q, k, v, return_lse=True)
 
+## lse can be used to combine results of multiple kv partitions,
+## see `dkernel.combine_attn_partitions` 
 
 # 2.) Using user defined arbitrary pattern
 
@@ -103,6 +105,7 @@ class SparseAttention(torch.nn.Module):
             block_size: int,
             sparse_pattern: Tensor,
             *,
+            causal: bool=True,
             seq_dim: Optional[int]=None,
             block_m: Optional[int]=None,
             block_n: Optional[int]=None,
@@ -182,7 +185,7 @@ class LocalStrideSparseAttention(SparseAttention):
         seqlens: real seqlen, can be optionally used when has right padding.
             No need to specify if left_paddings is used.
             Can only be used at inference.
-"""
+        return_lse: return the softmax logsumexp, which is usual for sequence partition
 
 ```
 

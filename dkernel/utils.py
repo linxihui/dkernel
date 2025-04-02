@@ -9,7 +9,7 @@ import triton
 import numpy as np
 from collections import namedtuple
 from torch import Tensor
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 # from scipy import sparse
 
 
@@ -105,7 +105,7 @@ def ccol_row_to_dense(ccol: Tensor,
 def get_sparse_attn_mask(num_heads: int,
                          seqlen: int,
                          block_size: int=64,
-                         local_blocks: int=4,
+                         local_blocks: Union[int, Tuple[int, int]]=4,
                          vert_stride: int=4,
                          homo_head=False,
                          num_kv_heads=None,
@@ -113,14 +113,26 @@ def get_sparse_attn_mask(num_heads: int,
                          dtype=torch.bfloat16,
                          device=None,
                          return_dense=False,
-                         head_sliding_steps=None,
+                         head_sliding_step=None,
                          head_sliding_offset=0,
-                         num_dense_heads=0):
+                         num_dense_heads=0,
+                         q_start_position=None,
+                         kv_start_position=None,
+                         vert_position_type = None,
+                         causal=True):
     """Create the crow sparse layout, thhe block mask and the dense mask.
 
     # TODO: with num_kv_heads, make the pattern size (num_kv_heads, m_blocks, n_blocks), instead of (num_heads, ..., )
-    :param head_sliding_steps: default to 1 if num_heads >= vert_stride else int(vert_stride / num_heads).
+    :param num_heads:
+    :param seqlen:
+    :param block_size:
+    :param local_blocks: int for causal, or (int, int) for (left, right). This number includes the current blocks
+    :param head_sliding_step: default to 1 if num_heads >= vert_stride else int(vert_stride / num_heads).
+        Skipped if vert_position_type="relative".
     :param head_sliding_offsets:
+    :param q_start_position, kv_start_position: for sequence paralllel/chunking
+    :param vert_position_type: 'absolute' or 'relative'
+        Default to None, i.e., absolute for causal to save kv cache and relative for bidirectional
     :return: a tuple of 3:
         - tuple of crow_indices, col_indices representation of CSR format.
         - block dense mask
@@ -134,33 +146,79 @@ def get_sparse_attn_mask(num_heads: int,
         # head_sliding_offset = 0
         assert num_dense_heads == 0, f"Cannot have dense head if stride pattern for heads is homogeneous."
 
+    if vert_position_type is None:
+        vert_position_type = 'absolute' if causal else 'relative'
+    else:
+        assert vert_position_type in ('absolute', 'relative')
+
     num_kv_heads = num_kv_heads or num_heads
     num_sparse_heads = num_kv_heads - num_dense_heads
     num_q_per_kv = num_heads // num_kv_heads
 
+    q_start_block = 0
+    kv_start_block = 0
+    if q_start_position is not None:
+        assert q_start_position % block_size == 0, "Sequence chunking must be at the block boundary"
+        q_start_block = q_start_position // block_size
+        assert past_len in [0, None], f"Cannot specify both past_len and q_start_position"
+    if kv_start_position is not None:
+        assert kv_start_position % block_size == 0, "Sequence chunking must be at the block boundary"
+        kv_start_block = kv_start_position // block_size
+
+    if causal:
+        assert local_blocks >= 1
+        local_blocks = (local_blocks, 1)  # 1 mean only the current on the right
+    else:
+        if isinstance(local_blocks, int):
+            assert local_blocks >= 0
+            local_blocks = (local_blocks, local_blocks)
+        else:
+            assert isinstance(local_blocks, tuple) and len(local_blocks) == 2
+            assert all(x > 0 for x in local_blocks)
+
     with torch.no_grad():
         blocks = triton.cdiv(seqlen, block_size)
-        q_pos = torch.arange(blocks)[None, :, None]
-        k_pos = torch.arange(blocks)[None, None]
-        head_sliding_step = max(1, int(vert_stride / num_heads))  # if vert_stride <= num_heads, rotating the heads
-        # TODO: make it (num_kv_heads, ) instead of expand to (num_heads,)
-        mask_vert_strided = [(torch.arange(blocks) + h * head_sliding_step + head_sliding_offset) % vert_stride == 0
-                             if h < num_sparse_heads else torch.ones(blocks).bool()
-                             for h in range(num_kv_heads) for _ in range(num_q_per_kv) ]
-        mask_vert_strided = torch.vstack(mask_vert_strided).unsqueeze(1)
-        block_mask = ((q_pos >= k_pos) & ((q_pos - k_pos < local_blocks) | mask_vert_strided)).to(device).to(dtype)
+        q_pos = q_start_block + torch.arange(blocks)[None, :, None]
+        k_pos = kv_start_block + torch.arange(blocks)[None, None]
+        if head_sliding_step is None:
+            head_sliding_step = max(1, int(vert_stride / num_heads))  # if vert_stride <= num_heads, rotating the heads
+        if vert_position_type == 'absolute':
+            # using absolute position for vertical
+            mask_vert_strided = [(kv_start_block + torch.arange(blocks) + h * head_sliding_step + head_sliding_offset) % vert_stride == 0
+                                if h < num_sparse_heads else torch.ones(blocks).bool()
+                                for h in range(num_kv_heads) for _ in range(num_q_per_kv) ]
+            mask_vert_strided = torch.vstack(mask_vert_strided).unsqueeze(1)
+            local_mask = ((q_pos - k_pos) < local_blocks[0]).logical_and(k_pos - q_pos < local_blocks[1])
+            block_mask = (mask_vert_strided | local_mask)
+        else:
+            left_mask = (q_pos - k_pos) - local_blocks[0] + 1
+            left_mask = (left_mask) * (left_mask > 0).type_as(left_mask)
+            right_mask = (k_pos - q_pos) - local_blocks[1] + 1
+            right_mask = (right_mask) * (right_mask > 0).type_as(right_mask)
+            mask_vert_strided = [(left_mask + right_mask) % vert_stride == 0
+                                if h < num_sparse_heads else torch.ones(blocks).bool()
+                                for h in range(num_kv_heads) for _ in range(num_q_per_kv) ]
+            block_mask = torch.vstack(mask_vert_strided)
+
+        if causal:
+            # TODO: make it (num_kv_heads, ) instead of expand to (num_heads,)
+            block_mask = (q_pos >= k_pos) & block_mask
+
+        block_mask = block_mask.to(dtype).to(device)
+
         q_start_block = triton.cdiv(past_len, block_size)
         trimmed_block_mask = block_mask[:, q_start_block:]
 
     if return_dense:
         mask_dense = torch.kron(block_mask, block_mask.new_ones((block_size, block_size)))[..., :seqlen, :seqlen]
-        causal_mask = torch.tril(torch.ones(seqlen, seqlen)).type_as(mask_dense)[past_len:]
-        mask_dense = mask_dense[..., past_len:, :] * causal_mask[None]
+        if causal:
+            causal_mask = torch.tril(torch.ones(seqlen, seqlen)).type_as(mask_dense)[past_len:]
+            mask_dense = mask_dense[..., past_len:, :] * causal_mask[None]
         return dense_to_crow_col(trimmed_block_mask), trimmed_block_mask, mask_dense
     else:
         return dense_to_crow_col(trimmed_block_mask), trimmed_block_mask, None
 
-    
+
 def is_kv_cache_efficient(sparse_pattern: Tensor, block_m: int, block_n: int) -> bool:
     """ A sparse pattern is KV cache friendly, when the non-local KV used in generated later tokens
     are also used in generating earlier tokens.
@@ -178,11 +236,10 @@ def is_kv_cache_efficient(sparse_pattern: Tensor, block_m: int, block_n: int) ->
 
 
 def verify_sparse_pattern(sparse_pattern: Tensor) -> None:
-    """Check sparse_pattern dimensions, 
+    """Check sparse_pattern dimensions,
     """
     assert sparse_pattern.dim() in (2, 3)
     assert sparse_pattern.size(-2) == sparse_pattern.size(-1)
-    assert is_causal(sparse_pattern), "Only causal attention is supported now."
 
 
 def is_causal(sparse_pattern: Tensor) -> bool:

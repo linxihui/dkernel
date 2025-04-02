@@ -67,6 +67,14 @@ def test_dims_and_dtype():
         dtype=torch.bfloat16, homo_head=False)
 
 
+def test_noncausal():
+    "bidirectional attention"
+    general_test_fn(1, 2, 2048, 64, local_blocks=4, vert_stride=8, block_size=64,
+                    dtype=torch.float16, homo_head=False, causal=False)
+    general_test_fn(1, 1, 2048, 64, local_blocks=4, vert_stride=10000, block_size=32,
+                    dtype=torch.float16, homo_head=False, causal=False)
+
+
 def test_dims_no_power_of_2():
     # head_dim not power of 2
     general_test_fn(2, 2, 2048, 48, block_size=64,
@@ -229,7 +237,8 @@ def general_test_fn(b, h, seqlen, d,
             varlen=False,
             std=1,
             has_left_paddings=False,
-            has_right_paddings=False):
+            has_right_paddings=False,
+            causal=True):
 
     qlen = seqlen
     past_len = past_len or 0
@@ -280,7 +289,8 @@ def general_test_fn(b, h, seqlen, d,
                                                             num_kv_heads=num_kv_heads,
                                                             num_dense_heads=num_dense_heads,
                                                             head_sliding_offset=head_sliding_offset,
-                                                            return_dense=True)
+                                                            return_dense=True,
+                                                            causal=causal)
 
     # reference implementation
     if has_left_paddings or has_right_paddings or varlen:
@@ -298,7 +308,7 @@ def general_test_fn(b, h, seqlen, d,
     else:
         mask_dense = mask_dense[..., past_len:seqlen, :seqlen]
 
-    ref_out = torch_attention(q, k, v, mask_dense, sm_scale, seq_dim=seq_dim)
+    ref_out = torch_attention(q, k, v, mask_dense, sm_scale, seq_dim=seq_dim, causal=causal)
     ref_out0 = ref_out.clone()
 
     if backward:
@@ -320,8 +330,10 @@ def general_test_fn(b, h, seqlen, d,
                                                         block_n=block_n,
                                                         d_splits=d_splits,
                                                         seq_dim=seq_dim,
-                                                        head_sliding_offset=0
+                                                        head_sliding_offset=0,
+                                                        causal=causal
                                                         )
+
         sparse_attention_fn.to(q.device).to(q.dtype)
 
     if varlen:
@@ -417,7 +429,8 @@ def torch_attention(q, k, v,
                     block_attn_mask=None,
                     block_size=128,
                     do=None,
-                    seq_dim=2):
+                    seq_dim=2,
+                    causal=True):
     """
     :param q, k, v: shape=(batch, heads, seq, head_dim) if seq_dim=2 (default)
             or shape=(batch, seq, heads, head_dim) if seq_dim=1.
@@ -441,8 +454,9 @@ def torch_attention(q, k, v,
             attn = torch.einsum('bhmd,bhnd->bhmn', q_block, k[:, :, :e]).float() * sm_scale
             mask = block_attn_mask[..., s // block_size, : (s // block_size + 1)]
             mask = torch.kron(mask, torch.ones(block_size, block_size, device=mask.device))
-            mask[..., :, s:].masked_fill_(torch.arange(0, block_size)[:, None] <= torch.arange(0, block_size)[None, :], 0)
-            attn = attn.masked_fill((1 - mask).bool(), float('-inf'))
+            if causal:
+                mask[..., :, s:].masked_fill_(torch.arange(0, block_size)[:, None] <= torch.arange(0, block_size)[None, :], 0)
+                attn = attn.masked_fill((1 - mask).bool(), float('-inf'))
             attn = attn.softmax(-1)
             out = torch.einsum('bhmn,bhnd->bhmd', attn.type_as(v), v[:, :, :e])
             outs.append(out)

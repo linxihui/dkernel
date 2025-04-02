@@ -24,19 +24,22 @@ from dkernel.ops.sparse_attn_fwd import _load_with_2d_mask, _store_with_2d_mask
     {
         'EVEN_M_BLOCK': lambda kwargs: kwargs['N_CTX'] % kwargs['BLOCK_M'] == 0,
         'ROUNDED_CTX': lambda kwargs: multiple_of(kwargs['N_CTX'], kwargs['BLOCK_M']),
+        'HAS_DLSE': lambda kwargs: kwargs['DL'] is not None,
         'BLOCK_D': lambda kwargs: triton.next_power_of_2(kwargs['D']),
         'EVEN_D_BLOCK': lambda kwargs: triton.next_power_of_2(kwargs['D']) == kwargs['D'],
     }
 )
 @triton.jit
 def _bwd_preprocess(
-    Out, DO, # assume Out, DO have same layout.
-    Delta, # assume contiguous layout, rounded length ((N_CTX + BLOCK_M - 1) // BLOCK_M) * BLOKC_M
+    Out, DO, DL, # assume Out, DO have same layout.
+    Delta, # assume contiguous layout, rounded length ((N_CTX + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
     stride_oz, stride_oh, stride_om, stride_od,
+    stride_lz, stride_lh, stride_lm,
     H, N_CTX, D,
     ROUNDED_CTX,
     BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
     EVEN_M_BLOCK: tl.constexpr,
+    HAS_DLSE: tl.constexpr,
     EVEN_D_BLOCK: tl.constexpr,
 ):
     offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -64,6 +67,13 @@ def _bwd_preprocess(
                            EVEN_D_BLOCK).to(tl.float32)
 
     delta = tl.sum(o * do, axis=1)
+
+    if HAS_DLSE:
+        # Support grad of lse
+        # delta = tl.sum(o * do, axis=1) - dlse
+        DL += off_z * stride_lz + off_h * stride_lh
+        dl = _load_with_1d_mask(DL + offs_m * stride_lm, offs_m, N_CTX, EVEN_M_BLOCK)
+        delta -= dl
     _store_with_1d_mask(Delta + offs_m, delta,
                         offs_m, N_CTX,
                         EVEN_M_BLOCK)
@@ -88,7 +98,6 @@ def _bwd_inner_dkdv(
     IS_DIAG_BLOCK: tl.constexpr,
 ):
 
-    # offs_qm = start_m + tl.arange(0, BLOCK_M)
     offs_m_curr = start_m + offs_m
     q_ptrs =   Q + (offs_m_curr[:, None] * stride_qm + offs_d[None, :] * stride_qd)
     # load q, k, v, do on-chip
@@ -184,6 +193,7 @@ def _bwd_kernel_dkdv(
     EVEN_N_BLOCK: tl.constexpr,
     EVEN_D_BLOCK: tl.constexpr,
     NUM_DBLOCKS: tl.constexpr,
+    CAUSAL: tl.constexpr,
 ):
     # start_n = tl.program_id(0)
     # off_hz = tl.program_id(1)
@@ -263,8 +273,9 @@ def _bwd_kernel_dkdv(
 
     # for seqlen < max_seqlen, need to truncat up to seqlen
     # can use  max_m_blocks, as this is 'KV cache frendly"
-    max_m_blocks = (N_CTX - start_n * BLOCK_N + BLOCK_M - 1) // BLOCK_M
-    end_l = tl.minimum(end_l, start_l + max_m_blocks)
+    if CAUSAL:
+        max_m_blocks = (N_CTX - start_n * BLOCK_N + BLOCK_M - 1) // BLOCK_M
+        end_l = tl.minimum(end_l, start_l + max_m_blocks)
 
     # TODO: split into two loops:
     # 1. for diag blocks
@@ -289,7 +300,7 @@ def _bwd_kernel_dkdv(
             EVEN_D1_BLOCK,
             EVEN_D2_BLOCK,
             NUM_DBLOCKS,
-            True,
+            CAUSAL,
         )
 
     # write-back
@@ -428,6 +439,7 @@ def _bwd_kernel_dq(
     NUM_DBLOCKS: tl.constexpr,
     MERGED_Q: tl.constexpr,
     NUM_DIAG_BLOCKS: tl.constexpr,
+    CAUSAL: tl.constexpr,
 ):
     # start_m = tl.program_id(0)
     # off_hz = tl.program_id(1)
@@ -487,7 +499,10 @@ def _bwd_kernel_dq(
     # start_l, end_l = tl.split(se)
     start_l = tl.load(layout_ptr).to(tl.int32)
     end_l = tl.load(layout_ptr + layout_crow_stride_m).to(tl.int32)
-    non_diag_end = tl.maximum(end_l - NUM_DIAG_BLOCKS, start_l)
+    if CAUSAL:
+        non_diag_end = tl.maximum(end_l - NUM_DIAG_BLOCKS, start_l)
+    else:
+        non_diag_end = end_l
 
     qk_scale = sm_scale * 1.44269504
 
@@ -514,7 +529,7 @@ def _bwd_kernel_dq(
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             LAST_N_BLOCK=False,
-            CAUSAL=True,
+            CAUSAL=CAUSAL,
             EVEN_D1_BLOCK=EVEN_D1_BLOCK,
             EVEN_D2_BLOCK=EVEN_D2_BLOCK,
             NUM_DBLOCKS=NUM_DBLOCKS,
@@ -544,7 +559,7 @@ def _bwd_kernel_dq(
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             LAST_N_BLOCK=True,
-            CAUSAL=True,
+            CAUSAL=CAUSAL,
             EVEN_D1_BLOCK=EVEN_D1_BLOCK,
             EVEN_D2_BLOCK=EVEN_D2_BLOCK,
             NUM_DBLOCKS=NUM_DBLOCKS,
@@ -579,8 +594,8 @@ configs_bwd = [
     })
 @triton.autotune(
     configs_bwd,
-    key=["N_CTX_FOR_AUTOTUNE", "BLOCK_D", "NUM_DBLOCKS",
-        "BLOCK_M", "BLOCK_N", "BLOCK_M2", "BLOCK_N2"]
+    key=["N_CTX_FOR_AUTOTUNE", "BLOCK_D", "BLOCK_D2", "NUM_DBLOCKS",
+        "BLOCK_M", "BLOCK_N", "BLOCK_M2", "BLOCK_N2", "CAUSAL"]
     )
 @triton.jit
 def _sparse_bwd_kernel(
@@ -627,6 +642,7 @@ def _sparse_bwd_kernel(
     NUM_DBLOCKS: tl.constexpr,
     MERGED_Q: tl.constexpr,
     NUM_DIAG_BLOCKS: tl.constexpr,
+    CAUSAL: tl.constexpr,
 ):
     if (BLOCK_M == BLOCK_N2) | (tl.program_id(0) < NUM_M_BLOCK_FOR_DQ):
         _bwd_kernel_dq(
@@ -656,6 +672,7 @@ def _sparse_bwd_kernel(
             NUM_DBLOCKS,
             MERGED_Q,
             NUM_DIAG_BLOCKS,
+            CAUSAL,
         )
 
     if tl.program_id(0) >= NUM_M_BLOCK_FOR_DQ:
@@ -684,11 +701,13 @@ def _sparse_bwd_kernel(
             EVEN_N2_BLOCK,
             EVEN_D_BLOCK,
             NUM_DBLOCKS,
+            CAUSAL,
         )
 
 
 def _backward(ctx,
               do: Tensor,
+              dlse: Optional[Tensor],
               dq: Optional[Tensor]=None,
               dk: Optional[Tensor]=None,
               dv: Optional[Tensor]=None
@@ -733,7 +752,7 @@ def _backward(ctx,
     # should be stride empty_like(o) instead of do. TODO: for fp8, format for bwd and fwd might be diff.
     # but dtype should be fp32/bf16? as do_scaled is processed.
     # do_scaled = torch.empty_like(do)
-    delta = torch.empty_like(l).contiguous()
+    delta = torch.empty_like(m).contiguous()
     hdim, seq_dim = ctx.hdim, ctx.seq_dim
     qlen = q.size(seq_dim)
 
@@ -743,13 +762,18 @@ def _backward(ctx,
     assert len(set(get_non_trival_stride(x) for x in [o, dq, dk, dv, do])) == 1, \
             f"strides incompatible: strides of o, dq, dk, dv, do are {[x.stride() for x in [o, dq, dk, dv, do]]}."
 
+    if dlse is not None:
+        dlse_stride = (dlse.stride(0), dlse.stride(hdim), dlse.stride(seq_dim))
+    else:
+        dlse_stride =(0, 0, 0)
+
     grid = (triton.cdiv(qlen, dq_block_m), q.shape[0] * q.shape[hdim])
-    # print(f'>> {grid=}')
-    # TODO: autotune BLOCK_M for _bwd_preprocess
+
     _bwd_preprocess[grid](
-        o, do,
+        o, do, dlse,
         delta,
         do.stride(0), do.stride(hdim), do.stride(seq_dim), do.stride(3),
+        *dlse_stride,
         q.shape[hdim], qlen, q.shape[-1],
         BLOCK_M=dq_block_m,
     )
@@ -793,7 +817,6 @@ def _backward(ctx,
 
         ctx.grid[0], # num_blocks
         rounded_ctx,
-        # multiple_of(q.size(ctx.seq_dim), 1024), # N_CTX_FOR_AUTOTUNE
         num_m_block_for_dq,
         BLOCK_M=dq_block_m,
         BLOCK_N=dq_block_n,
@@ -802,69 +825,9 @@ def _backward(ctx,
         BLOCK_N2=dk_block_n,
         BLOCK_D2=ctx.block_d2,
         NUM_DBLOCKS=ctx.d_splits,
+        CAUSAL=ctx.causal,
         **ctx.kwargs
     )
-
-    if False:
-        _bwd_kernel_dkdv[grid](
-            q, k, v, ctx.sm_scale,
-            layout_ccol_indices,
-            layout_row_indices,
-            layout_ccol_indices.stride(0), layout_ccol_indices.stride(1),
-            layout_row_indices.stride(0), layout_row_indices.stride(1),
-
-            o, do,
-            dq, dk, dv,
-            l, m,
-            delta,
-            q.stride(0), q.stride(hdim), q.stride(seq_dim), q.stride(3),
-            k.stride(0), k.stride(hdim), k.stride(seq_dim), k.stride(3),
-            v.stride(0), v.stride(hdim), v.stride(seq_dim), v.stride(3),
-            o.stride(0), o.stride(hdim), o.stride(seq_dim), o.stride(3),
-            q.shape[0], q.shape[hdim], q.shape[seq_dim],
-            ctx.grid[0], # num_blocks
-            rounded_ctx,
-            multiple_of(q.size(ctx.seq_dim), 1024),
-            BLOCK_M=ctx.BLOCK_M,
-            BLOCK_N=ctx.BLOCK_N,
-            BLOCK_D=ctx.BLOCK_D,
-            NUM_DBLOCKS=q.shape[-1] // ctx.BLOCK_D,
-            **ctx.kwargs
-        )
-
-        grid = (triton.cdiv(q.shape[seq_dim], ctx.BLOCK_N), ctx.grid[1])
-
-        _bwd_kernel_dkdv[grid](
-            q, k, v, ctx.sm_scale,
-
-            layout_crow_indices,
-            layout_col_indices,
-            layout_crow_indices.stride(0), layout_crow_indices.stride(1),
-            layout_col_indices.stride(0), layout_col_indices.stride(1),
-
-            layout_ccol_indices,
-            layout_row_indices,
-            layout_ccol_indices.stride(0), layout_ccol_indices.stride(1),
-            layout_row_indices.stride(0), layout_row_indices.stride(1),
-
-            o, do,
-            dq, dk, dv,
-            l, m,
-            delta,
-            q.stride(0), q.stride(hdim), q.stride(seq_dim), q.stride(3),
-            k.stride(0), k.stride(hdim), k.stride(seq_dim), k.stride(3),
-            v.stride(0), v.stride(hdim), v.stride(seq_dim), v.stride(3),
-            o.stride(0), o.stride(hdim), o.stride(seq_dim), o.stride(3),
-            q.shape[0], q.shape[hdim], q.shape[seq_dim],
-            ctx.grid[0], # num_blocks
-            rounded_ctx,
-            multiple_of(q.size(ctx.seq_dim), 1024),
-            BLOCK_M=ctx.BLOCK_M,
-            BLOCK_N=ctx.BLOCK_N,
-            BLOCK_D=ctx.BLOCK_D,
-            NUM_DBLOCKS=q.shape[-1] // ctx.BLOCK_D,
-            **ctx.kwargs
-        )
 
     return dq, dk, dv
 
