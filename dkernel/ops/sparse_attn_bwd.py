@@ -720,6 +720,16 @@ def _backward(ctx,
     layout_crow_indices, layout_col_indices, dq_block_m, dq_block_n = ctx.layout_csr
     layout_ccol_indices, layout_row_indices, dk_block_m, dk_block_n = ctx.layout_csc
 
+    # See https://github.com/NVIDIA/Megatron-LM/blob/core_r0.9.0/megatron/core/extensions/transformer_engine.py#L557
+    # In PyTorch, the following two tensors are in fact the same:
+    #   Tensor with shape (1, S, H, D) and stride (S*H*D, H*D, D, 1)
+    #   Tensor with shape (1, S, H, D) and stride (H*D, H*D, D, 1)
+    # Stride for a dimension that is 1 has no meaning, so tensors created two different ways
+    # can have same shape but different strides.
+    # We unify them to the first one to pass the stride check
+    if o.shape == do.shape and o.shape[0] == 1 and o.stride() != do.stride():
+        do = do.as_strided(o.shape, o.stride())
+                  
     if not do.is_contiguous():
         # TODO: is it necessary to have non-contiguous layout
         do = do.contiguous()
