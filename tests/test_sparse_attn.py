@@ -213,6 +213,12 @@ def test_d_splits():
             dtype=torch.bfloat16, homo_head=False)
 
 
+def test_qkv_packing():
+    general_test_fn(2, 8, 8192, 128,  block_size=64, d_splits=None,
+            dtype=torch.bfloat16, homo_head=False, qkv_pack_mode='packed_kv')
+    general_test_fn(2, 8, 8192, 128,  block_size=64, d_splits=None,
+            dtype=torch.bfloat16, homo_head=False, qkv_pack_mode='packed_qkv')
+
 
 # @pytest.mark.parametrize('b, h, seqlen, d', [(2, 8, 2048, 128), (1, 4, 4096, 64)])
 def general_test_fn(b, h, seqlen, d,
@@ -238,6 +244,7 @@ def general_test_fn(b, h, seqlen, d,
             std=1,
             has_left_paddings=False,
             has_right_paddings=False,
+            qkv_pack_mode='split_qkv',
             causal=True):
 
     qlen = seqlen
@@ -255,7 +262,22 @@ def general_test_fn(b, h, seqlen, d,
         qlen2 = qlen + 19
     else:
         h2, seqlen2, qlen2 = h, seqlen, qlen
+        
+    assert qkv_pack_mode in ('split_qkv', 'packed_qkv', 'packed_kv')
     if seq_dim == 2:
+        # if qkv_pack_mode == 'packed_qkv':
+        #     assert qlen == seqlen
+        #     qkv = torch.empty((b, 3 * h, seqlen, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        #     q, k, v = qkv.chunk(3, dim=1)
+        # else:
+        #     q = torch.empty((b, h2, qlen2  , d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        #     if qkv_pack_mode == 'packed_kv':
+        #         kv = torch.empty((b, 2 * h, seqlen, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        #         k, v = kv.chunk(2, dim=1)
+        #     else:
+        #         k = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        #         v = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+
         q = torch.empty((b, h2, qlen2  , d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         k = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         v = torch.empty((b, h2, seqlen2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
@@ -264,7 +286,19 @@ def general_test_fn(b, h, seqlen, d,
         v = v[:, :h, :seqlen]
         h_dim = 1
     else:
-        q = torch.empty((b, qlen2  , h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        # if qkv_pack_mode == 'packed_qkv':
+        #     assert qlen == seqlen
+        #     qkv = torch.empty((b, seqlen, 3 * h, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        #     q, k, v = qkv.chunk(3, dim=1)
+        # else:
+        #     q = torch.empty((b, qlen2 , h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        #     if qkv_pack_mode == 'packed_kv':
+        #         kv = torch.empty((b, seqlen, 2 * h, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        #         k, v = kv.chunk(2, dim=1)
+        #     else:
+        #         k = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        #         v = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
+        q = torch.empty((b, qlen2 , h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         k = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         v = torch.empty((b, seqlen2, h2, d), dtype=dtype, device='cuda').normal_(mean=0, std=std)
         q = q[:, :qlen, :h]
@@ -317,6 +351,19 @@ def general_test_fn(b, h, seqlen, d,
         ref_dk, k.grad = k.grad.clone(), None
         ref_dq, q.grad = q.grad.clone(), None
 
+        if qkv_pack_mode == 'packed_qkv':
+            qkv = torch.cat([q, k, v], dim=h_dim).detach()
+            qkv.requires_grad_()
+            split_qkv = lambda x: x.chunk(3, dim=h_dim)
+            q, k, v = split_qkv(qkv)
+        elif qkv_pack_mode == 'packed_kv':
+            kv = torch.cat([k, v], dim=h_dim).detach()
+            kv.requires_grad_()
+            split_qkv = lambda x: x.chunk(2, dim=h_dim)
+            k, v = split_qkv(kv)
+        else:
+            split_qkv = None
+
     if sparse_attention_fn is None:
         sparse_attention_fn = LocalStrideSparseAttention(
                                                         h, max_seqlen,
@@ -356,7 +403,7 @@ def general_test_fn(b, h, seqlen, d,
         # lens = torch.randint(0, k.size(seq_dim), size=(k.size(0),))
         # import ipdb; ipdb.set_trace()
         if has_right_paddings:
-            tri_out = sparse_attention_fn(q, k, v, sm_scale, seqlens=lens)
+            tri_out = sparse_attention_fn(q, k, v, sm_scale=sm_scale, seqlens=lens)
 
             if past_len == 0:
                 for i, l in enumerate(lens):
@@ -382,7 +429,7 @@ def general_test_fn(b, h, seqlen, d,
                     q[i].narrow(seq_dim - 1, left, len)[:] = q[i].narrow(seq_dim - 1, 0, len).clone()
                     # q[i, left:] = q[i, :len]
             # import ipdb; ipdb.set_trace()
-            tri_out = sparse_attention_fn(q, k, v, sm_scale, left_paddings=left_paddings)
+            tri_out = sparse_attention_fn(q, k, v, sm_scale=sm_scale, left_paddings=left_paddings)
             if past_len == 0:
                 for i, len in enumerate(lens):
                     left = k.size(seq_dim) - len
@@ -393,7 +440,12 @@ def general_test_fn(b, h, seqlen, d,
                     # ref_out[i, left:] = ref_out[i, :len]
                     # ref_out[i, :left] = 0
     else:
-        tri_out = sparse_attention_fn(q, k, v, sm_scale)
+        if qkv_pack_mode == 'split_qkv':
+            tri_out = sparse_attention_fn(q, k, v, sm_scale=sm_scale)
+        elif qkv_pack_mode == 'packed_kv':
+            tri_out = sparse_attention_fn(q, kv, sm_scale=sm_scale, split_qkv=split_qkv)
+        else:
+            tri_out = sparse_attention_fn(qkv, sm_scale=sm_scale, split_qkv=split_qkv)
 
     # import ipdb; ipdb.set_trace()
     # decimal = 1 if dtype == torch.bfloat16 else 2
@@ -402,9 +454,17 @@ def general_test_fn(b, h, seqlen, d,
 
     if backward:
         tri_out.backward(dout)
-        tri_dv, v.grad = v.grad.clone(), None
-        tri_dk, k.grad = k.grad.clone(), None
-        tri_dq, q.grad = q.grad.clone(), None
+        if qkv_pack_mode == 'packed_qkv':
+            tri_dqkv, qkv.grad= qkv.grad.clone(), None
+            tri_dq, tri_dk, tri_dv = split_qkv(tri_dqkv)
+        elif qkv_pack_mode == 'packed_kv':
+            tri_dkv, kv.grad = kv.grad.clone(), None
+            tri_dk, tri_dv = split_qkv(tri_dkv)
+            tri_dq, q.grad = q.grad.clone(), None
+        else:
+            tri_dv, v.grad = v.grad.clone(), None
+            tri_dk, k.grad = k.grad.clone(), None
+            tri_dq, q.grad = q.grad.clone(), None
 
     if backward:
         assert torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=1e-2), \
@@ -505,8 +565,9 @@ def print_diff_stats(ref, tri):
 
 
 if __name__ == '__main__':
+    test_qkv_packing()
     general_test_fn(1, 1, 1024, 128, vert_stride=4, local_blocks=2, block_size=16,
                     dtype=torch.bfloat16, homo_head=False,
                     block_m=128, block_n=16, std=2,
-                    bwd_block_sizes=(128, 16, 128, 16)
+                    # bwd_block_sizes=(128, 16, 128, 16)
                     )

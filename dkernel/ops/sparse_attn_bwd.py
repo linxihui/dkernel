@@ -12,11 +12,15 @@ from dkernel.ops.sparse_attn_fwd import _load_with_2d_mask, _store_with_2d_mask
 @linxihui
 
 ## Limitation:
-1. In bwd, assume contiguous: Out, Do, DQ, DK, DV, L, M, D, seq(q) == seq(k), with stride_oz, stride_oh, stride_om, stride_od,
+1. In bwd, assume contiguous: Out, Do has same layout
 2. inference: very limit inference in the fwd training kernel.
     Maybe a better idea to separate inference and training.
 
 """
+
+
+def get_non_trival_stride(x):
+    return tuple(s if d > 1 else None for s, d in zip(x.stride(), x.size()))
 
 
 ## backward
@@ -88,7 +92,7 @@ def _bwd_inner_dkdv(
     start_m, offs_m, offs_n, offs_d, offs_d2,
     stride_qm, stride_qd,
     stride_om, stride_od,
-    N_CTX, D,
+    Q_LEN, D, PAST_LEN,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     EVEN_M_BLOCK: tl.constexpr,
@@ -102,7 +106,7 @@ def _bwd_inner_dkdv(
     q_ptrs =   Q + (offs_m_curr[:, None] * stride_qm + offs_d[None, :] * stride_qd)
     # load q, k, v, do on-chip
     q = _load_with_2d_mask(q_ptrs,
-                           offs_m_curr, N_CTX,
+                           offs_m_curr, Q_LEN,
                            offs_d, D,
                            EVEN_M_BLOCK,
                            EVEN_D1_BLOCK,
@@ -114,7 +118,7 @@ def _bwd_inner_dkdv(
     if NUM_DBLOCKS >= 2:
         q_ptrs = Q + (offs_m_curr[:, None] * stride_qm + offs_d2[None, :] * stride_qd)
         q2 = _load_with_2d_mask(q_ptrs,
-                               offs_m_curr, N_CTX,
+                               offs_m_curr, Q_LEN,
                                offs_d2, D,
                                EVEN_M_BLOCK,
                                EVEN_D2_BLOCK,
@@ -123,17 +127,17 @@ def _bwd_inner_dkdv(
 
     # TODO: causing "error: operation scheduled before its operands"
     if IS_DIAG_BLOCK: # row_idx_idx == start_l:
-        qk += tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), 0, float('-inf'))
+        qk += tl.where(offs_m_curr[:, None] + PAST_LEN >= (offs_n[None, :]), 0, float('-inf'))
 
     m = _load_with_1d_mask(m_ptrs + offs_m_curr,
-                           offs_m_curr, N_CTX,
+                           offs_m_curr, Q_LEN,
                            EVEN_M_BLOCK)
     p = tl.math.exp2(qk * qk_scale - m[:, None])
 
     # compute dv
     do_ptrs = DO + (offs_m_curr[:, None] * stride_om + offs_d[None, :] * stride_od)
     do = _load_with_2d_mask(do_ptrs,
-                            offs_m_curr, N_CTX,
+                            offs_m_curr, Q_LEN,
                             offs_d, D,
                             EVEN_M_BLOCK,
                             EVEN_D1_BLOCK)
@@ -141,7 +145,7 @@ def _bwd_inner_dkdv(
 
     # compute dp = dot(v, do)
     Di = _load_with_1d_mask(D_ptrs + offs_m_curr,
-                            offs_m_curr, N_CTX,
+                            offs_m_curr, Q_LEN,
                             EVEN_M_BLOCK)
     dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
     dp += tl.dot(do, tl.trans(v))
@@ -149,7 +153,7 @@ def _bwd_inner_dkdv(
     if NUM_DBLOCKS >= 2:
         do_ptrs = DO + (offs_m_curr[:, None] * stride_om + offs_d2[None, :] * stride_od)
         do = _load_with_2d_mask(do_ptrs,
-                                offs_m_curr, N_CTX,
+                                offs_m_curr, Q_LEN,
                                 offs_d2, D,
                                 EVEN_M_BLOCK,
                                 EVEN_D2_BLOCK)
@@ -182,8 +186,9 @@ def _bwd_kernel_dkdv(
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
-    # stride_dz, stride_dh, stride_dm, stride_dd,
-    Z, H, N_CTX, D, ROUNDED_CTX,
+    stride_dkz, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvz, stride_dvh, stride_dvn, stride_dvd,
+    Z, H, Q_LEN, N_CTX, D, PAST_LEN, ROUNDED_CTX,
     num_block,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -205,8 +210,8 @@ def _bwd_kernel_dkdv(
     V += off_z * stride_vz + off_h * stride_vh
     DO += off_z * stride_oz + off_h * stride_oh
     # DQ += off_z * stride_oz + off_h * stride_oh
-    DK += off_z * stride_oz + off_h * stride_oh
-    DV += off_z * stride_oz + off_h * stride_oh
+    DK += off_z * stride_dkz + off_h * stride_dkh
+    DV += off_z * stride_dvz + off_h * stride_dvh
     # Look like this loop can be parallelled
     # for start_n in range(0, num_block):
 
@@ -273,13 +278,16 @@ def _bwd_kernel_dkdv(
 
     # for seqlen < max_seqlen, need to truncat up to seqlen
     # can use  max_m_blocks, as this is 'KV cache frendly"
+
     if CAUSAL:
-        max_m_blocks = (N_CTX - start_n * BLOCK_N + BLOCK_M - 1) // BLOCK_M
+        max_m_blocks = (tl.minimum(Q_LEN, (N_CTX -  start_n * BLOCK_N)) + BLOCK_M - 1) // BLOCK_M
         end_l = tl.minimum(end_l, start_l + max_m_blocks)
 
     # TODO: split into two loops:
     # 1. for diag blocks
     # 2. for non-diag blocks
+
+    # NOTE: This can be empty in some case, i.e, start and end are the same
     for row_idx_idx in range(start_l, end_l):
         row_idx = tl.load(layout_row_ptr + off_h * layout_row_stride_h + row_idx_idx * layout_row_stride_m).to(tl.int32)
         start_m = row_idx * BLOCK_M
@@ -293,7 +301,7 @@ def _bwd_kernel_dkdv(
             start_m, offs_m, offs_n, offs_d, offs_d2,
             stride_qm, stride_qd,
             stride_om, stride_od,
-            N_CTX, D,
+            Q_LEN, D, PAST_LEN,
             BLOCK_M,
             BLOCK_N,
             EVEN_M_BLOCK,
@@ -304,14 +312,16 @@ def _bwd_kernel_dkdv(
         )
 
     # write-back
-    dv_ptrs = DV + (offs_n[:, None] * stride_om + offs_d[None, :] * stride_od)
-    dk_ptrs = DK + (offs_n[:, None] * stride_om + offs_d[None, :] * stride_od)
+
+    # tl.device_print('start_n, num_blocks', start_n * 100000 + (end_l - start_l))
+    dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd)
+    dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd)
     _store_with_2d_mask(dv_ptrs, dv, offs_n, N_CTX, offs_d, D, EVEN_N_BLOCK, EVEN_D1_BLOCK)
     _store_with_2d_mask(dk_ptrs, dk, offs_n, N_CTX, offs_d, D, EVEN_N_BLOCK, EVEN_D1_BLOCK)
 
     if NUM_DBLOCKS >= 2:
-        dv_ptrs = DV + (offs_n[:, None] * stride_om + offs_d2[None, :] * stride_od)
-        dk_ptrs = DK + (offs_n[:, None] * stride_om + offs_d2[None, :] * stride_od)
+        dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d2[None, :] * stride_dvd)
+        dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d2[None, :] * stride_dkd)
         _store_with_2d_mask(dv_ptrs, dv2, offs_n, N_CTX, offs_d2, D, EVEN_N_BLOCK, EVEN_D2_BLOCK)
         _store_with_2d_mask(dk_ptrs, dk2, offs_n, N_CTX, offs_d2, D, EVEN_N_BLOCK, EVEN_D2_BLOCK)
 
@@ -425,9 +435,9 @@ def _bwd_kernel_dq(
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
-    # stride_dz, stride_dh, stride_dm, stride_dd,
+    stride_dqz, stride_dqh, stride_dqm, stride_dqd,
     # TODO: strides for DO
-    Z, H, N_CTX, D, ROUNDED_CTX,
+    Z, H, Q_LEN, N_CTX, D, PAST_LEN, ROUNDED_CTX,
     num_block,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -450,7 +460,7 @@ def _bwd_kernel_dq(
     K  += off_z * stride_kz + off_h * stride_kh
     V  += off_z * stride_vz + off_h * stride_vh
     DO += off_z * stride_oz + off_h * stride_oh
-    DQ += off_z * stride_oz + off_h * stride_oh
+    DQ += off_z * stride_dqz + off_h * stride_dqh
     # DK += off_z * stride_oz + off_h * stride_oh
     # DV += off_z * stride_oz + off_h * stride_oh
     # Look like this loop can be parallelled
@@ -475,18 +485,18 @@ def _bwd_kernel_dq(
     EVEN_D1_BLOCK: tl.constexpr = EVEN_D_BLOCK | (NUM_DBLOCKS >= 2)
     EVEN_D2_BLOCK: tl.constexpr = EVEN_D_BLOCK
 
-    q  = _load_with_2d_mask( q_ptrs, offs_m, N_CTX, offs_d, D, EVEN_M_BLOCK, EVEN_D1_BLOCK, other=0)
-    do = _load_with_2d_mask(do_ptrs, offs_m, N_CTX, offs_d, D, EVEN_M_BLOCK, EVEN_D1_BLOCK, other=0)
-    m  = _load_with_1d_mask( m_ptrs, offs_m, N_CTX, EVEN_M_BLOCK)
-    Di = _load_with_1d_mask( d_ptrs, offs_m, N_CTX, EVEN_M_BLOCK)
+    q  = _load_with_2d_mask( q_ptrs, offs_m, Q_LEN, offs_d, D, EVEN_M_BLOCK, EVEN_D1_BLOCK, other=0)
+    do = _load_with_2d_mask(do_ptrs, offs_m, Q_LEN, offs_d, D, EVEN_M_BLOCK, EVEN_D1_BLOCK, other=0)
+    m  = _load_with_1d_mask( m_ptrs, offs_m, Q_LEN, EVEN_M_BLOCK)
+    Di = _load_with_1d_mask( d_ptrs, offs_m, Q_LEN, EVEN_M_BLOCK)
 
     if NUM_DBLOCKS >= 2:
         offs_d2 = BLOCK_D + tl.arange(0, BLOCK_D2)
         q_ptrs  = Q  + (offs_m[:, None] * stride_qm + offs_d2[None, :] * stride_qd)
         do_ptrs = DO + (offs_m[:, None] * stride_om + offs_d2[None, :] * stride_od)
         dq2 = tl.zeros([BLOCK_M, BLOCK_D2], dtype=tl.float32)
-        q2  = _load_with_2d_mask( q_ptrs, offs_m, N_CTX, offs_d2, D, EVEN_M_BLOCK, EVEN_D2_BLOCK, other=0)
-        do2 = _load_with_2d_mask(do_ptrs, offs_m, N_CTX, offs_d2, D, EVEN_M_BLOCK, EVEN_D2_BLOCK, other=0)
+        q2  = _load_with_2d_mask( q_ptrs, offs_m, Q_LEN, offs_d2, D, EVEN_M_BLOCK, EVEN_D2_BLOCK, other=0)
+        do2 = _load_with_2d_mask(do_ptrs, offs_m, Q_LEN, offs_d2, D, EVEN_M_BLOCK, EVEN_D2_BLOCK, other=0)
         kt_ptrs2 =  K + (offs_n[None, :] * stride_kn + offs_d2[:, None] * stride_kd)
         vt_ptrs2 =  V + (offs_n[None, :] * stride_vn + offs_d2[:, None] * stride_vd)
     else:
@@ -524,8 +534,8 @@ def _bwd_kernel_dq(
             offs_m, offs_n, offs_d, offs_d2,
             stride_kn, stride_kd,
             stride_vn, stride_vd,
-            0, N_CTX, D,
-            dtype =Q.dtype.element_ty,
+            PAST_LEN, N_CTX, D,
+            dtype=Q.dtype.element_ty,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             LAST_N_BLOCK=False,
@@ -554,7 +564,7 @@ def _bwd_kernel_dq(
             offs_m, offs_n, offs_d, offs_d2,
             stride_kn, stride_kd,
             stride_vn, stride_vd,
-            0, N_CTX, D,
+            PAST_LEN, N_CTX, D,
             dtype =Q.dtype.element_ty,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
@@ -567,12 +577,12 @@ def _bwd_kernel_dq(
             )
 
     # write-back
-    dq_ptrs = DQ + (offs_m[:, None] * stride_om + offs_d[None, :] * stride_od)
-    _store_with_2d_mask(dq_ptrs, dq, offs_m, N_CTX, offs_d, D, EVEN_M_BLOCK, EVEN_D1_BLOCK)
+    dq_ptrs = DQ + (offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd)
+    _store_with_2d_mask(dq_ptrs, dq, offs_m, Q_LEN, offs_d, D, EVEN_M_BLOCK, EVEN_D1_BLOCK)
 
     if NUM_DBLOCKS >= 2:
-        dq_ptrs = DQ + (offs_m[:, None] * stride_om + offs_d2[None, :] * stride_od)
-        _store_with_2d_mask(dq_ptrs, dq2, offs_m, N_CTX, offs_d2, D, EVEN_M_BLOCK, EVEN_D2_BLOCK)
+        dq_ptrs = DQ + (offs_m[:, None] * stride_dqm + offs_d2[None, :] * stride_dqd)
+        _store_with_2d_mask(dq_ptrs, dq2, offs_m, Q_LEN, offs_d2, D, EVEN_M_BLOCK, EVEN_D2_BLOCK)
 
 
 # Does not suuport unequal seqlen(q) and seqlen(k)
@@ -618,12 +628,15 @@ def _sparse_bwd_kernel(
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
-    # stride_dz, stride_dh, stride_dm, stride_dd,
+    stride_dqz, stride_dqh, stride_dqm, stride_dqd,
+    stride_dkz, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvz, stride_dvh, stride_dvn, stride_dvd,
     # TODO: strides for DO
-    Z, H, N_CTX, D,
+    Z, H, Q_LEN, N_CTX, D, PAST_LEN,
     num_block,
     ROUNDED_CTX,
-    NUM_M_BLOCK_FOR_DQ,
+    NUM_BLOCKS_FOR_DQ: tl.constexpr,
+    OFFSET_BLOCKS_FOR_DKDV: tl.constexpr,
     N_CTX_FOR_AUTOTUNE,
 
     BLOCK_M: tl.constexpr,
@@ -644,7 +657,7 @@ def _sparse_bwd_kernel(
     NUM_DIAG_BLOCKS: tl.constexpr,
     CAUSAL: tl.constexpr,
 ):
-    if (BLOCK_M == BLOCK_N2) | (tl.program_id(0) < NUM_M_BLOCK_FOR_DQ):
+    if tl.program_id(0) < NUM_BLOCKS_FOR_DQ:
         _bwd_kernel_dq(
             tl.program_id(0), tl.program_id(1),
             Q, K, V, sm_scale,
@@ -660,7 +673,8 @@ def _sparse_bwd_kernel(
             stride_kz, stride_kh, stride_kn, stride_kd,
             stride_vz, stride_vh, stride_vn, stride_vd,
             stride_oz, stride_oh, stride_om, stride_od,
-            Z, H, N_CTX, D, ROUNDED_CTX,
+            stride_dqz, stride_dqh, stride_dqm, stride_dqd,
+            Z, H, Q_LEN, N_CTX, D, PAST_LEN, ROUNDED_CTX,
             num_block,
             BLOCK_M,
             BLOCK_N,
@@ -675,9 +689,9 @@ def _sparse_bwd_kernel(
             CAUSAL,
         )
 
-    if tl.program_id(0) >= NUM_M_BLOCK_FOR_DQ:
+    if tl.program_id(0) >= OFFSET_BLOCKS_FOR_DKDV:
         _bwd_kernel_dkdv(
-            tl.program_id(0) - NUM_M_BLOCK_FOR_DQ, tl.program_id(1),
+            tl.program_id(0) - OFFSET_BLOCKS_FOR_DKDV, tl.program_id(1),
             Q, K, V, sm_scale,
             layout_ccol_ptr,
             layout_row_ptr,
@@ -691,7 +705,9 @@ def _sparse_bwd_kernel(
             stride_kz, stride_kh, stride_kn, stride_kd,
             stride_vz, stride_vh, stride_vn, stride_vd,
             stride_oz, stride_oh, stride_om, stride_od,
-            Z, H, N_CTX, D, ROUNDED_CTX,
+            stride_dkz, stride_dkh, stride_dkn, stride_dkd,
+            stride_dvz, stride_dvh, stride_dvn, stride_dvd,
+            Z, H, Q_LEN, N_CTX, D, PAST_LEN, ROUNDED_CTX,
             num_block,
             BLOCK_M2,
             BLOCK_N2,
@@ -720,14 +736,12 @@ def _backward(ctx,
     layout_crow_indices, layout_col_indices, dq_block_m, dq_block_n = ctx.layout_csr
     layout_ccol_indices, layout_row_indices, dk_block_m, dk_block_n = ctx.layout_csc
 
-    if not do.is_contiguous():
-        # TODO: is it necessary to have non-contiguous layout
-        do = do.contiguous()
+    # assert len(set(get_non_trival_stride(x) for x in [o, do])) == 1, \
+    #         f"strides incompatible: strides of o, do are {[x.stride() for x in [o, do]]}."
 
-    if not o.is_contiguous():
-        # TODO: currently only work with contiguous q/k/v.
+    if get_non_trival_stride(o) != get_non_trival_stride(do):
         o = o.contiguous()
-        # raise ValueError(f'output is not contiguous: {o.stride()=}. This is maybe caused by q/k/v not being contiguous.')
+        do = do.contiguous()
 
     if layout_ccol_indices.dim() == 1:
         layout_ccol_indices = layout_ccol_indices[None].expand(q.shape[hdim], -1)
@@ -735,16 +749,16 @@ def _backward(ctx,
 
     # do = do.contiguous()
 
-    def _check_or_new_tensor(x):
+    def _check_or_new_tensor(x, shape):
         if x is not None:
-            assert x.shape == q.shape and x.is_contiguous()
+            assert x.shape == shape
         else:
-            x = q.new_empty(q.shape).contiguous()
+            x = q.new_empty(shape)
         return x
 
-    dq = _check_or_new_tensor(dq)
-    dk = _check_or_new_tensor(dk)
-    dv = _check_or_new_tensor(dv)
+    dq = _check_or_new_tensor(dq, q.shape)
+    dk = _check_or_new_tensor(dk, k.shape)
+    dv = _check_or_new_tensor(dv, v.shape)
 
     # dq = dq if dq is not None else q.new_empty(q.shape).contiguous()
     # dk = dk if dk is not None else k.new_empty(k.shape).contiguous()
@@ -755,12 +769,7 @@ def _backward(ctx,
     delta = torch.empty_like(m).contiguous()
     hdim, seq_dim = ctx.hdim, ctx.seq_dim
     qlen = q.size(seq_dim)
-
-    def get_non_trival_stride(x):
-        return tuple(s if d > 1 else None for s, d in zip(x.stride(), x.size()))
-
-    assert len(set(get_non_trival_stride(x) for x in [o, dq, dk, dv, do])) == 1, \
-            f"strides incompatible: strides of o, dq, dk, dv, do are {[x.stride() for x in [o, dq, dk, dv, do]]}."
+    klen = k.size(seq_dim)
 
     if dlse is not None:
         dlse_stride = (dlse.stride(0), dlse.stride(hdim), dlse.stride(seq_dim))
@@ -778,20 +787,27 @@ def _backward(ctx,
         BLOCK_M=dq_block_m,
     )
 
-    if dq_block_m == dk_block_n:
+    if dq_block_m == dk_block_n and qlen == klen:
         # a pid process dq and dkdv sequentially, this naturally
         # balances the computation of each pid.
-        num_m_block_for_dq = 0
         num_seq_blocks = triton.cdiv(qlen, dq_block_m)
+        num_blocks_for_dq = num_seq_blocks
+        offset_blocks_for_dkdv = 0
     else:
         # dq and dkdv are computed in different pid
-        num_m_block_for_dq = triton.cdiv(qlen, dq_block_m)
-        num_seq_blocks = num_m_block_for_dq + triton.cdiv(qlen, dk_block_m)
+        num_blocks_for_dq = triton.cdiv(qlen, dq_block_m)
+        offset_blocks_for_dkdv = num_blocks_for_dq
+        num_seq_blocks = num_blocks_for_dq + triton.cdiv(klen, dk_block_n)
 
     grid = (num_seq_blocks, grid[1])
+    # print(f'>> bwd: {num_blocks_for_dq=}, {offset_blocks_for_dkdv=}, {qlen=}, {klen=}, {grid=}')
     rounded_ctx = delta.size(-1)
 
+    def _to_order_bhsd(x: tuple):
+        return tuple([x[0], x[hdim], x[seq_dim]] + list(x[3:]))
+
     # TODO:  autotune BLOCK_M, BLOCK_N, layout_crow_indices can be heuristic with lamda function??
+
     _sparse_bwd_kernel[grid](
         q, k, v, ctx.sm_scale,
 
@@ -809,15 +825,19 @@ def _backward(ctx,
         dq, dk, dv,
         l, m,
         delta,
-        q.stride(0), q.stride(hdim), q.stride(seq_dim), q.stride(3),
-        k.stride(0), k.stride(hdim), k.stride(seq_dim), k.stride(3),
-        v.stride(0), v.stride(hdim), v.stride(seq_dim), v.stride(3),
-        o.stride(0), o.stride(hdim), o.stride(seq_dim), o.stride(3),
-        q.shape[0], q.shape[hdim], q.shape[seq_dim], q.shape[-1],
-
+        *_to_order_bhsd(q.stride()),
+        *_to_order_bhsd(k.stride()),
+        *_to_order_bhsd(v.stride()),
+        *_to_order_bhsd(o.stride()), # shared between o, do
+        *_to_order_bhsd(dq.stride()),
+        *_to_order_bhsd(dk.stride()), # dk might have diff length to dq
+        *_to_order_bhsd(dv.stride()), # dv mihgt have diff head_dim to dk
+        q.shape[0], q.shape[hdim], q.shape[seq_dim], k.shape[seq_dim], q.shape[-1],
+        ctx.past_len, # PAST_LEN
         ctx.grid[0], # num_blocks
         rounded_ctx,
-        num_m_block_for_dq,
+        num_blocks_for_dq,
+        offset_blocks_for_dkdv,
         BLOCK_M=dq_block_m,
         BLOCK_N=dq_block_n,
         BLOCK_D=ctx.block_d,

@@ -88,6 +88,8 @@ class SparseAttention(torch.nn.Module):
         if sparse_pattern.dim() == 2:
             sparse_pattern = zero_stride(sparse_pattern[None])
 
+        # Now sparse_pattern is normalized to be 3D
+
         verify_sparse_pattern(sparse_pattern)
         if causal and not is_kv_cache_efficient(sparse_pattern, block_size, block_size):
             warnings.warn("The provided sparse_pattern is not efficient for KV cache, "
@@ -98,7 +100,7 @@ class SparseAttention(torch.nn.Module):
         self.block_m = block_m
         self.block_n = block_n
         self.seq_dim = seq_dim
-        self.max_seqlen = sparse_pattern.size(1) * block_size
+        self.max_seqlen = max(sparse_pattern.shape[1:]) * block_size
         self.kwargs = copy.copy(kwargs)
         self.kwargs["max_seqlen"] = self.max_seqlen
         self.kwargs['causal'] = causal
@@ -146,8 +148,8 @@ class SparseAttention(torch.nn.Module):
 
     def forward(self,
                 q: Tensor,
-                k: Tensor,
-                v: Tensor,
+                k: Optional[Tensor]=None,
+                v: Optional[Tensor]=None,
                 sm_scale: Optional[int]=None,
                 *,
                 cu_seqlen_k: Optional[Tensor]=None,
@@ -155,17 +157,27 @@ class SparseAttention(torch.nn.Module):
                 left_paddings: Optional[Tensor]=None,
                 seqlens: Optional[Tensor]=None,
                 return_lse: bool=False,
+                split_qkv: Optional[callable]=None,
                 ) -> Tensor:
         """
         :param q, k, v:
-            Case 1: for training (requires backward):
-                shape=(batch, seq, heads, head_dim) if self.seq_dim=1 or None (default)
-                or shape=(batch, heads, seq, head_dim) if self.seq_dim=2.
-                Cannot have left paddings
-            Case 2: for inference (does not require backward)
-                Can be either 4D like in Case 1, with `left_paddings` or right paddings `seqlens`,
-                    or 3D with packed sequence in FlashAttn (total_num_tokens, heads, head_dim), where
-                    total_num_tokens = sum(seqlens)
+
+            Packing:
+                if k, v is None, assuming q, k, v are packed as `q`, and unpacked by `split_qkv` as:
+                    `q, k, v = split_qkv(q)`
+                if q, k specified, but v is None, assuming k, v are packed as `k`, and unpacked by `split_qkv` as:
+                    `k, v = split_qkv(k)`
+
+            Shapes:
+                Case 1: for training (requires backward):
+                    shape=(batch, seq, heads, head_dim) if self.seq_dim=1 or None (default)
+                    or shape=(batch, heads, seq, head_dim) if self.seq_dim=2.
+                    Cannot have left paddings
+                Case 2: for inference (does not require backward)
+                    Can be either 4D like in Case 1, with `left_paddings` or right paddings `seqlens`,
+                        or 3D with packed sequence in FlashAttn (total_num_tokens, heads, head_dim), where
+                        total_num_tokens = sum(seqlens)
+
         :param sm_scale: softmax scale, default to `1/sqrt(q.size(-1))`.
         :param cu_seqlen_k: shape=(batch+1, ) (0, seqlen1, seqlen1 + seqlen2, ...., sum(seqlens))
             Can only be used at inference.
@@ -177,22 +189,10 @@ class SparseAttention(torch.nn.Module):
             No need to specify if left_paddings is used.
             Can only be used at inference.
         :param return_lse: whether to return log softmax, mostly to combine kv partitions.
+        :param split_qkv: must be specified if `v` is None, i.e., `qkv` is packed as in input`q`,
+            or `kv` is packed as in input `k`.
         """
 
-        # check heads
-        seq_dim = self.seq_dim or 1
-        hdim = 3 - (seq_dim or 1) if q.dim() == 4 else 1
-        assert self.layout_csr_crow.size(0) in [1, k.size(hdim), q.size(hdim)], \
-            (f"Input (q, k) have ({q.size(hdim)}, {k.size(hdim)}) heads"
-             f"but the number of heads in the sparse pattern is {self.layout_csr_crow.size(0)}")
-
-        # check seqlen
-        if q.dim() == 4:
-            assert k.size(seq_dim) <= self.max_seqlen, \
-                (f"Input length {k.size(seq_dim)} is larger "
-                 f"than the maximum length allowed ({self.max_seqlen})")
-
-        sm_scale = sm_scale or 1. / math.sqrt(float(q.size(-1)))
         inf_kwargs = {"cu_seqlen_k": cu_seqlen_k,
                       "cu_seqlen_q": cu_seqlen_q,
                       "left_paddings": left_paddings,
@@ -201,6 +201,7 @@ class SparseAttention(torch.nn.Module):
 
         kwargs = copy.copy(self.kwargs)
         kwargs["return_lse"] = return_lse
+        kwargs['split_qkv'] = split_qkv
         output, lse = _sparse_attention.apply(q, k, v,
                     sm_scale,
                     (self.layout_csr_crow, self.layout_csr_col, self.block_m,  self.block_n),

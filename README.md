@@ -89,7 +89,7 @@ output = attn(q, k, v, sm_scale=0.008)
     1. Prefilling phase (prompting/1st token): no padding, left/right paddings as well as packed variable length input are supported.
     2. Decoding phase: only no padding, left/right paddings are allowed. Variable length inputs
     are disallowed as it not efficient for KV cache update.
-    
+
     For better KV cache as well as continuous batching, we recommend to use vLLM, which supports
     the same local-stride sparse attention (checkout the phi-3-small model in vLLM).
 
@@ -110,7 +110,7 @@ class SparseAttention(torch.nn.Module):
             block_m: Optional[int]=None,
             block_n: Optional[int]=None,
             out: Optional[Tensor]=None
-            **kwargs):
+            **kwargs)
 
 class LocalStrideSparseAttention(SparseAttention):
     def __init__(self,
@@ -127,6 +127,7 @@ class LocalStrideSparseAttention(SparseAttention):
             head_sliding_offset: int=0,
             block_m: Optional[int]=None,
             block_n: Optional[int]=None,
+            causal: bool=True,
             **kwargs
             )
 
@@ -137,6 +138,7 @@ class LocalStrideSparseAttention(SparseAttention):
     sparse_pattern: 2D or 3D (per head) boolean/uint8 Tensor(squared). 1=used, 0=skipped.
     seq_dim: the dimension indice for the token sequence. Default to dimension 1.
 
+    causal: True for generative moodel or False for BERT like model with bidirectional attention.
     num_heads: number of q heads.
     max_seq_len: max sequence length the model supports.
     local_blocks: number of local blocks (sliding window).
@@ -167,14 +169,20 @@ class LocalStrideSparseAttention(SparseAttention):
         Arguments:
         =========
         q, k, v:
-            Case 1: for training (requires backward):
-                shape=(batch, seq, heads, head_dim) if self.seq_dim=1 or None (default)
-                or shape=(batch, heads, seq, head_dim) if self.seq_dim=2.
-                Cannot have left paddings
-            Case 2: for inference (does not require backward)
-                Can be either 4D like in Case 1, with `left_paddings` or right paddings `seqlens`,
-                    or 3D with packed sequence in FlashAttn (total_num_tokens, heads, head_dim), where
-                    total_num_tokens = sum(seqlens)
+            Packing:
+                if k, v is None, assuming q, k, v are packed as `q`, and unpacked by `split_qkv` as:
+                    `q, k, v = split_qkv(q)`
+                if q, k specified, but v is None, assuming k, v are packed as `k`, and unpacked by `split_qkv` as:
+                    `k, v = split_qkv(k)`
+            Shapes:
+                Case 1: for training (requires backward):
+                    shape=(batch, seq, heads, head_dim) if self.seq_dim=1 or None (default)
+                    or shape=(batch, heads, seq, head_dim) if self.seq_dim=2.
+                    Cannot have left paddings
+                Case 2: for inference (does not require backward)
+                    Can be either 4D like in Case 1, with `left_paddings` or right paddings `seqlens`,
+                        or 3D with packed sequence in FlashAttn (total_num_tokens, heads, head_dim), where
+                        total_num_tokens = sum(seqlens)
         sm_scale: softmax scale, default to `1/sqrt(q.size(-1))`.
         cu_seqlen_k: shape=(batch+1, ) (0, seqlen1, seqlen1 + seqlen2, ...., sum(seqlens))
             Can only be used at inference.
@@ -186,7 +194,33 @@ class LocalStrideSparseAttention(SparseAttention):
             No need to specify if left_paddings is used.
             Can only be used at inference.
         return_lse: return the softmax logsumexp, which is usual for sequence partition
+        split_qkv: must be specified if `v` is None, i.e., `qkv` is packed as in input`q`,
+            or `kv` is packed as in input `k`.
 
+```
+## Support attention on chunked KVs
+
+This is work in both inference for increasing SM utlization and  training for Ring-like sequence parallelization.
+
+For detail, see code example in `tests/test_seq_partition.py`.
+
+```python
+def combine_attn_partitions(*x: Tuple[Tensor], hdim=1):
+    """For context parallelization, to combine multiple results from
+    multiple segments of k/v using output & softmax_lse (the weight logit).
+
+    This function is typically used in scenarios where outputs and their
+    corresponding weight logits (log-softmax values) from multiple partitions
+    need to be merged into a single result.
+    Args:
+        *x (Tuple[Tensor]): A variable number of tuples, where each tuple
+            contains two tensors: the output tensor and the weight logit tensor.
+        hdim (int, optional): The head dimension along which the weights are
+            expanded before applying them to the outputs. Defaults to 1.
+    Returns:
+        Tensor: The combined result obtained by weighting the outputs with
+            their corresponding softmax logits and summing across segments.
+    """
 ```
 
 # Benchmarking

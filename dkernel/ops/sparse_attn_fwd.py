@@ -190,7 +190,7 @@ def _sparse_fwd_kernel(
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
-    Z, H, N_CTX, D,
+    Z, H, Q_LEN, N_CTX, D,
     PAST_LEN,
     Q_ROUNDED_LEN,
     N_CTX_FOR_AUTOTUNE,
@@ -207,7 +207,7 @@ def _sparse_fwd_kernel(
     NUM_DIAG_BLOCKS: tl.constexpr,
     CAUSAL: tl.constexpr,
 ):
-    Q_LEN = N_CTX - PAST_LEN
+    # Q_LEN = N_CTX - PAST_LEN
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
     off_h = off_hz % H
@@ -388,11 +388,12 @@ def _forward(ctx,
             layout_csr: Tuple[Tensor, Tensor, int, int],
             seq_dim: int=1,
             inference: Optional[bool]=None,
-            out:Optional[Tensor]=None,
+            out: Optional[Tensor]=None,
             d_splits: Optional[int]=None,
             max_seqlen: Optional[int]=None,
             return_lse: bool=False,
             causal=True,
+            split_qkv: Optional[bool]=None,
             ) -> Tensor:
     """
     :param q, k, v: shape=(batch, n_heads, seq_len, head_size) if seq_len=2 else (batch, seq_len, n_heads, head_size).
@@ -430,11 +431,12 @@ def _forward(ctx,
 
     # TODO: Remove the need to slicing layout_crow_indices.
     #       Compute the offset inside the kernel
-    if qlen != klen:
+    # if qlen != klen:
+    if qlen == 1:  # decoding
         # assert klen > qlen
-        assert qlen == 1, \
-            ("If q has differnt seq length that k and v, q should only have 1 token per batch for decoding,"
-            f"but got q length = {qlen}.")
+        # assert qlen == 1, \
+        #     ("If q has differnt seq length that k and v, q should only have 1 token per batch for decoding,"
+        #     f"but got q length = {qlen}.")'
         layout_crow_indices = layout_crow_indices[..., (klen - qlen) // block_m:]
 
     # TODO: do I need to set o.requires_grad to True explicitely?
@@ -512,6 +514,8 @@ def _forward(ctx,
         assert d_splits in [1, 2]
         block_d = triton.next_power_of_2(q.shape[-1] // d_splits)
 
+    past_len = k.shape[seq_dim] - q.shape[seq_dim] if causal else 0
+
     _sparse_fwd_kernel[grid](
         q, k, v, sm_scale,
         layout_crow_indices,
@@ -524,8 +528,8 @@ def _forward(ctx,
         k.stride(0), k.stride(hdim), k.stride(seq_dim), k.stride(3),
         v.stride(0), v.stride(hdim), v.stride(seq_dim), v.stride(3),
         o.stride(0), o.stride(hdim), o.stride(seq_dim), o.stride(3),
-        q.shape[0], q.shape[hdim], k.shape[seq_dim], q.shape[-1],
-        k.shape[seq_dim] - q.shape[seq_dim], # PAST_LEN
+        q.shape[0], q.shape[hdim], q.shape[seq_dim], k.shape[seq_dim], q.shape[-1],
+        past_len, # PAST_LEN
         q_rounded_len,
         multiple_of(qlen, 1024), # N_CTX_FOR_AUTOTUNE, TODO: inference??
         BLOCK_M=block_m,
@@ -553,6 +557,7 @@ def _forward(ctx,
     ctx.hdim = hdim
     ctx.causal = causal
     ctx.d_splits = d_splits
+    ctx.past_len = past_len
     ctx.kwargs = kwargs
 
     # m here is the log2sumexp ()
